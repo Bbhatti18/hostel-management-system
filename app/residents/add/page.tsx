@@ -4,7 +4,7 @@ import Link from "next/link";
 import Sidebar from "@/components/layout/Sidebar";
 import { supabase } from "@/lib/supabase";
 export default function AddResidentPage() {
-  const [saved, setSaved] = useState(false);
+  const [, setSaved] = useState(false);
   const [name, setName] = useState("");
 const [phone, setPhone] = useState("");
 const [room, setRoom] = useState("");

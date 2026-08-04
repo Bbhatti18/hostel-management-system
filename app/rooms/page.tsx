@@ -3,6 +3,14 @@
 import { FormEvent, useCallback, useEffect, useMemo, useState } from "react";
 import type { ReactNode } from "react";
 import { supabase } from "@/lib/supabase";
+import {
+  prepareRoomBedCapacity,
+  provisionRoomBeds,
+  rollbackRoomBedChanges,
+  type BedCapacityResult,
+} from "@/lib/bedProvisioning";
+import { getSupabaseErrorMessage } from "@/lib/supabaseErrors";
+import { isOperationalBedStatus } from "@/lib/statuses";
 
 type RoomStatus =
   | "Available"
@@ -42,6 +50,13 @@ type RoomForm = {
   has_balcony: boolean;
   description: string;
   status: RoomStatus;
+};
+
+type RoomBed = {
+  id: string;
+  room_id: string;
+  bed_number: string;
+  status: string | null;
 };
 
 const emptyForm: RoomForm = {
@@ -94,6 +109,11 @@ function roomToForm(room: Room): RoomForm {
 
 export default function RoomsPage() {
   const [rooms, setRooms] = useState<Room[]>([]);
+  const [roomBeds, setRoomBeds] = useState<RoomBed[]>([]);
+  const [referencedRoomIds, setReferencedRoomIds] = useState<Set<string>>(
+    new Set(),
+  );
+  const [relationshipsVerified, setRelationshipsVerified] = useState(false);
   const [form, setForm] = useState<RoomForm>(emptyForm);
   const [editingId, setEditingId] = useState<string | null>(null);
   const [search, setSearch] = useState("");
@@ -109,22 +129,57 @@ export default function RoomsPage() {
     setLoading(true);
     setError("");
 
-    const { data, error: fetchError } = await supabase
-      .from("rooms")
-      .select("*")
-      .order("room_number", { ascending: true });
+    const [roomResult, bedResult, admissionResult] = await Promise.all([
+      supabase.from("rooms").select("*").order("room_number", {
+        ascending: true,
+      }),
+      supabase.from("beds").select("id, room_id, bed_number, status"),
+      supabase.from("admissions").select("room_id"),
+    ]);
 
-    if (fetchError) {
-      setError(fetchError.message);
+    if (roomResult.error) {
+      setError(getSupabaseErrorMessage(roomResult.error, "Rooms could not be loaded."));
       setRooms([]);
     } else {
-      setRooms((data ?? []) as Room[]);
+      setRooms((roomResult.data ?? []) as Room[]);
+    }
+
+    if (bedResult.error || admissionResult.error) {
+      setError((current) =>
+        current
+          ? `${current} | Unable to verify room relationships.`
+          : "Unable to verify room relationships.",
+      );
+      setRoomBeds([]);
+      setReferencedRoomIds(new Set());
+      setRelationshipsVerified(false);
+    } else {
+      setRoomBeds(
+        ((bedResult.data ?? []) as Array<{
+          id: string;
+          room_id: string | null;
+          bed_number: string;
+          status: string | null;
+        }>).filter((bed): bed is RoomBed => Boolean(bed.room_id)),
+      );
+      setReferencedRoomIds(
+        new Set(
+          (
+            (admissionResult.data ?? []) as Array<{ room_id: string | null }>
+          )
+            .map((admission) => admission.room_id)
+            .filter((id): id is string => Boolean(id)),
+        ),
+      );
+      setRelationshipsVerified(true);
     }
 
     setLoading(false);
   }, []);
 
   useEffect(() => {
+    // Loading remote Supabase data is the external synchronization for this effect.
+    // eslint-disable-next-line react-hooks/set-state-in-effect
     void loadRooms();
   }, [loadRooms]);
 
@@ -236,6 +291,7 @@ export default function RoomsPage() {
       block_name: nullable(form.block_name),
       room_type: form.room_type.trim() || "Shared",
       total_beds: totalBeds,
+      capacity: totalBeds,
       monthly_rent: monthlyRent,
       security_deposit_amount: securityDeposit,
       has_ac: form.has_ac,
@@ -245,27 +301,104 @@ export default function RoomsPage() {
       status: form.status,
     };
 
-    const result = editingId
-      ? await supabase.from("rooms").update(payload).eq("id", editingId)
-      : await supabase.from("rooms").insert(payload);
+    let bedCapacityResult: BedCapacityResult | null = null;
+    if (editingId) {
+      bedCapacityResult = await prepareRoomBedCapacity({
+        roomId: editingId,
+        capacity: totalBeds,
+        allowIncrease: form.status !== "Inactive",
+      });
+      if (bedCapacityResult.error) {
+        setError(bedCapacityResult.error);
+        setSaving(false);
+        return;
+      }
+    }
 
-    if (result.error) {
-      setError(result.error.message);
+    const result = editingId
+      ? await supabase
+          .from("rooms")
+          .update(payload)
+          .eq("id", editingId)
+          .select("id")
+          .single()
+      : await supabase.from("rooms").insert(payload).select("id").single();
+
+    if (result.error || !result.data) {
+      const rolledBack = bedCapacityResult
+        ? await rollbackRoomBedChanges(bedCapacityResult)
+        : true;
+      setError(
+        rolledBack
+          ? getSupabaseErrorMessage(result.error, "The room could not be saved. No bed changes were kept.")
+          : "The room could not be saved, and some bed statuses could not be restored. Refresh and review this room before trying again.",
+      );
       setSaving(false);
       return;
     }
 
-    setMessage(
-      editingId ? "Room updated successfully." : "Room added successfully."
-    );
+    const savedRoomId = String(result.data.id);
+    let partialSuccessError = "";
+    if (!editingId && form.status !== "Inactive") {
+      const provisionResult = await provisionRoomBeds({
+        roomId: savedRoomId,
+        capacity: totalBeds,
+      });
+
+      if (provisionResult.errors.length > 0) {
+        partialSuccessError = `Room saved, but only ${provisionResult.created} of ${provisionResult.requested} missing beds were created. Refresh and retry after resolving the database error.`;
+      } else {
+        setMessage(
+          `${editingId ? "Room updated" : "Room added"} successfully.${
+            provisionResult.created > 0
+              ? ` ${provisionResult.created} vacant bed${
+                  provisionResult.created === 1 ? " was" : "s were"
+                } created automatically.`
+              : ""
+          }`,
+        );
+      }
+    } else if (!editingId) {
+      setMessage(
+        `${editingId ? "Room updated" : "Room added"} successfully. No beds were created because the room is Inactive.`,
+      );
+    } else {
+      const changes = bedCapacityResult!;
+      setMessage(
+        `Room updated successfully.${
+          changes.deactivated > 0
+            ? ` ${changes.deactivated} surplus bed${changes.deactivated === 1 ? " was" : "s were"} marked Inactive.`
+            : ""
+        }${
+          changes.restored > 0
+            ? ` ${changes.restored} inactive bed${changes.restored === 1 ? " was" : "s were"} restored as Vacant.`
+            : ""
+        }${
+          changes.created > 0
+            ? ` ${changes.created} new vacant bed${changes.created === 1 ? " was" : "s were"} created.`
+            : ""
+        }`,
+      );
+    }
     closeForm();
     await loadRooms();
+    if (partialSuccessError) setError(partialSuccessError);
     setSaving(false);
   }
 
   async function handleDelete(room: Room) {
+    if (!relationshipsVerified) {
+      setError("Room relationships could not be verified. Nothing was deleted.");
+      return;
+    }
+
+    const hasLinks =
+      roomBeds.some((bed) => bed.room_id === room.id) ||
+      referencedRoomIds.has(room.id);
     const confirmed = window.confirm(
-      `Delete room ${room.room_number}? This action cannot be undone.`
+      hasLinks
+        ? `Mark room ${room.room_number} Inactive? Linked records will be preserved.`
+        : `Delete room ${room.room_number}? This action cannot be undone.`,
     );
 
     if (!confirmed) return;
@@ -274,19 +407,43 @@ export default function RoomsPage() {
     setMessage("");
     setError("");
 
-    const { error: deleteError } = await supabase
-      .from("rooms")
-      .delete()
-      .eq("id", room.id);
+    const result = hasLinks
+      ? await supabase
+          .from("rooms")
+          .update({ status: "Inactive" })
+          .eq("id", room.id)
+      : await supabase.from("rooms").delete().eq("id", room.id);
 
-    if (deleteError) {
+    if (
+      result.error &&
+      !hasLinks &&
+      /foreign key|constraint|23503/i.test(result.error.message)
+    ) {
+      const { error: inactiveError } = await supabase
+        .from("rooms")
+        .update({ status: "Inactive" })
+        .eq("id", room.id);
+
+      if (!inactiveError) {
+        setMessage("Room marked Inactive. Linked records were preserved.");
+        await loadRooms();
+        setDeletingId(null);
+        return;
+      }
+    }
+
+    if (result.error) {
       setError(
-        deleteError.message.includes("foreign key")
-          ? "This room has linked beds, admissions or records. Delete those records first."
-          : deleteError.message
+        /foreign key|constraint|23503/i.test(result.error.message)
+          ? "This room is linked to beds, admissions, or other records and cannot be deleted. Mark it Inactive instead."
+          : "The room could not be updated. Please try again.",
       );
     } else {
-      setMessage("Room deleted successfully.");
+      setMessage(
+        hasLinks
+          ? "Room marked Inactive. Linked records were preserved."
+          : "Room deleted successfully.",
+      );
       await loadRooms();
     }
 
@@ -615,8 +772,8 @@ export default function RoomsPage() {
                           Room {room.room_number}
                         </p>
                         <p className="mt-1 text-xs text-slate-500">
-                          {room.block_name || "No block"} Â· Floor{" "}
-                          {room.floor_number ?? "â"}
+                          {room.block_name || "No block"} · Floor{" "}
+                          {room.floor_number ?? "—"}
                         </p>
                       </td>
 
@@ -625,7 +782,24 @@ export default function RoomsPage() {
                       </td>
 
                       <td className="whitespace-nowrap px-5 py-4 text-sm font-semibold text-slate-800">
+                        {roomBeds.filter(
+                          (bed) =>
+                            bed.room_id === room.id &&
+                            isOperationalBedStatus(bed.status),
+                        ).length}
+                        {" / "}
                         {room.total_beds}
+                        {roomBeds.filter(
+                          (bed) =>
+                            bed.room_id === room.id &&
+                            isOperationalBedStatus(bed.status),
+                        )
+                          .length > room.total_beds && (
+                          <p className="mt-1 max-w-48 whitespace-normal text-xs font-medium text-amber-700">
+                            Existing beds exceed capacity. Increase capacity
+                            before adding more.
+                          </p>
+                        )}
                       </td>
 
                       <td className="whitespace-nowrap px-5 py-4">
@@ -678,8 +852,8 @@ export default function RoomsPage() {
                             className="rounded-lg border border-red-200 px-3 py-2 text-xs font-semibold text-red-700 hover:bg-red-50 disabled:opacity-50"
                           >
                             {deletingId === room.id
-                              ? "Deleting..."
-                              : "Delete"}
+                              ? "Updating..."
+                              : "Archive / Delete"}
                           </button>
                         </div>
                       </td>

@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import { useParams, useRouter } from "next/navigation";
 import { supabase } from "@/lib/supabase";
 
@@ -26,13 +26,7 @@ export default function EditStaffPage() {
   const [pageLoading, setPageLoading] = useState(true);
   const [saving, setSaving] = useState(false);
 
-  useEffect(() => {
-    if (staffId) {
-      fetchStaff();
-    }
-  }, [staffId]);
-
-  async function fetchStaff() {
+  const fetchStaff = useCallback(async () => {
     setPageLoading(true);
 
     const { data, error } = await supabase
@@ -87,7 +81,14 @@ export default function EditStaffPage() {
     setNotes(data.notes ?? "");
 
     setPageLoading(false);
-  }
+  }, [staffId]);
+
+  useEffect(() => {
+    if (staffId) {
+      const timeoutId = window.setTimeout(() => void fetchStaff(), 0);
+      return () => window.clearTimeout(timeoutId);
+    }
+  }, [fetchStaff, staffId]);
 
   async function handleSubmit(
     e: React.FormEvent<HTMLFormElement>

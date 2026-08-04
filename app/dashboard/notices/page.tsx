@@ -57,7 +57,8 @@ export default function NoticesPage() {
   };
 
   useEffect(() => {
-    void loadNotices();
+    const timeoutId = window.setTimeout(() => void loadNotices(), 0);
+    return () => window.clearTimeout(timeoutId);
   }, []);
 
   const filteredNotices = useMemo(() => {

@@ -2,6 +2,7 @@
 
 import {
   FormEvent,
+  useCallback,
   useEffect,
   useMemo,
   useState,
@@ -136,7 +137,7 @@ export default function EditNoticePage() {
     }));
   }, [staffMembers]);
 
-  const loadNotice = async () => {
+  const loadNotice = useCallback(async () => {
     setLoading(true);
 
     const [
@@ -255,13 +256,13 @@ if (!notice) {
     );
 
     setLoading(false);
-  };
+  }, [noticeId]);
 
   useEffect(() => {
-  if (Number.isFinite(noticeId)) {
-    void loadNotice();
-  }
-}, [noticeId]);
+    if (!Number.isFinite(noticeId)) return;
+    const timeoutId = window.setTimeout(() => void loadNotice(), 0);
+    return () => window.clearTimeout(timeoutId);
+  }, [loadNotice, noticeId]);
  
 const handleAudienceChange = (
     value: AudienceType

@@ -10,6 +10,10 @@ import {
   useState,
 } from "react";
 import { supabase } from "@/lib/supabase";
+import {
+  getSupabaseErrorMessage,
+  isMissingColumnError,
+} from "@/lib/supabaseErrors";
 
 type ResidentStatus =
   | "Active"
@@ -120,6 +124,18 @@ function text(value: unknown) {
   return value == null ? "" : String(value);
 }
 
+function normalizeEmail(value: unknown) {
+  return text(value).trim().toLowerCase();
+}
+
+function normalizePhone(value: unknown) {
+  return text(value).replace(/[\s()-]/g, "");
+}
+
+function normalizeIdentity(value: unknown) {
+  return text(value).trim().toLowerCase().replace(/[\s-]/g, "");
+}
+
 function firstText(row: GenericRow | null, keys: string[]) {
   if (!row) return "";
 
@@ -211,7 +227,7 @@ export default function ResidentsPage() {
       .order("created_at", { ascending: false });
 
     if (loadError) {
-      setError(loadError.message);
+      setError(getSupabaseErrorMessage(loadError, "Unable to load residents."));
       setResidents([]);
     } else {
       setResidents((data ?? []) as Resident[]);
@@ -221,6 +237,8 @@ export default function ResidentsPage() {
   }, []);
 
   useEffect(() => {
+    // Loading remote Supabase data is the external synchronization for this effect.
+    // eslint-disable-next-line react-hooks/set-state-in-effect
     void refresh();
   }, [refresh]);
 
@@ -427,6 +445,11 @@ export default function ResidentsPage() {
   }
 
   function openEditForm(resident: Resident) {
+    if (resident.status === "Archived") {
+      setError("Archived resident records cannot be edited.");
+      return;
+    }
+
     setEditingId(resident.id);
     setForm({
       resident_code: resident.resident_code ?? "",
@@ -491,9 +514,9 @@ export default function ResidentsPage() {
       return;
     }
 
-    const normalizedEmail = form.email.trim().toLowerCase();
-    const normalizedPhone = form.phone.trim();
-    const normalizedCnic = form.cnic.trim();
+    const normalizedEmail = normalizeEmail(form.email);
+    const normalizedPhone = normalizePhone(form.phone);
+    const normalizedCnic = normalizeIdentity(form.cnic);
 
     const { data: duplicateRows, error: duplicateError } = await supabase
       .from("residents")
@@ -501,16 +524,21 @@ export default function ResidentsPage() {
       .order("created_at", { ascending: false });
 
     if (duplicateError) {
-      setError(duplicateError.message);
+      setError(
+        getSupabaseErrorMessage(
+          duplicateError,
+          "Unable to verify resident details. Please try again.",
+        ),
+      );
       setSaving(false);
       return;
     }
 
     const duplicate = (duplicateRows ?? []).find((row: GenericRow) => {
       const sameId = text(row.id) === editingId;
-      const sameEmail = normalizedEmail && text(row.email).toLowerCase() === normalizedEmail;
-      const samePhone = normalizedPhone && text(row.phone) === normalizedPhone;
-      const sameCnic = normalizedCnic && text(row.cnic) === normalizedCnic;
+      const sameEmail = normalizedEmail && normalizeEmail(row.email) === normalizedEmail;
+      const samePhone = normalizedPhone && normalizePhone(row.phone) === normalizedPhone;
+      const sameCnic = normalizedCnic && normalizeIdentity(row.cnic) === normalizedCnic;
       return !sameId && (sameEmail || samePhone || sameCnic);
     });
 
@@ -562,19 +590,25 @@ export default function ResidentsPage() {
         ? await supabase.from("residents").update(payload).eq("id", editingId)
         : await supabase.from("residents").insert(payload);
 
-      if (result.error && /column|does not exist|not exist/i.test(result.error.message)) {
+      if (result.error && isMissingColumnError(result.error)) {
         result = editingId
           ? await supabase.from("residents").update(fallbackPayload).eq("id", editingId)
           : await supabase.from("residents").insert(fallbackPayload);
       }
-    } catch (saveError) {
-      setError(saveError instanceof Error ? saveError.message : "Unable to save resident.");
+    } catch {
+      setError("Unable to save resident. Please try again.");
       setSaving(false);
       return;
     }
 
     if (result.error) {
-      setError(result.error.message);
+      setError(
+        getSupabaseErrorMessage(
+          result.error,
+          "Unable to save resident. Please try again.",
+          "A resident with the same email, phone, or CNIC already exists.",
+        ),
+      );
       setSaving(false);
       return;
     }
@@ -586,6 +620,8 @@ export default function ResidentsPage() {
   }
 
   async function archiveResident(resident: Resident) {
+    if (resident.status === "Archived") return;
+
     const confirmed = window.confirm(`Archive resident ${resident.full_name}?`);
     if (!confirmed) return;
 
@@ -599,7 +635,12 @@ export default function ResidentsPage() {
       .eq("id", resident.id);
 
     if (archiveError) {
-      setError(archiveError.message);
+      setError(
+        getSupabaseErrorMessage(
+          archiveError,
+          "Unable to archive this resident. Please try again.",
+        ),
+      );
     } else {
       setMessage("Resident archived successfully.");
       await refresh();
@@ -821,8 +862,12 @@ export default function ResidentsPage() {
                       <td className="px-5 py-4">
                         <div className="flex flex-wrap gap-2">
                           <button type="button" onClick={() => openProfile(resident)} className="rounded-lg border border-indigo-200 px-3 py-2 text-xs font-semibold text-indigo-700">Profile</button>
-                          <button type="button" onClick={() => openEditForm(resident)} className="rounded-lg border border-slate-200 px-3 py-2 text-xs font-semibold text-slate-700">Edit</button>
-                          <button type="button" disabled={archivingId === resident.id} onClick={() => void archiveResident(resident)} className="rounded-lg border border-amber-200 px-3 py-2 text-xs font-semibold text-amber-700 disabled:opacity-50">{archivingId === resident.id ? "Archiving..." : "Archive"}</button>
+                          {resident.status !== "Archived" && (
+                            <>
+                              <button type="button" onClick={() => openEditForm(resident)} className="rounded-lg border border-slate-200 px-3 py-2 text-xs font-semibold text-slate-700">Edit</button>
+                              <button type="button" disabled={archivingId === resident.id} onClick={() => void archiveResident(resident)} className="rounded-lg border border-amber-200 px-3 py-2 text-xs font-semibold text-amber-700 disabled:opacity-50">{archivingId === resident.id ? "Archiving..." : "Archive"}</button>
+                            </>
+                          )}
                         </div>
                       </td>
                     </tr>

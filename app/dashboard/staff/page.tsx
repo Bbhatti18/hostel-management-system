@@ -21,10 +21,6 @@ export default function StaffPage() {
   const [loading, setLoading] = useState(true);
   const [deletingId, setDeletingId] = useState<number | null>(null);
 
-  useEffect(() => {
-    fetchStaff();
-  }, []);
-
   async function fetchStaff() {
     setLoading(true);
 
@@ -52,6 +48,11 @@ export default function StaffPage() {
 
     setLoading(false);
   }
+
+  useEffect(() => {
+    const timeoutId = window.setTimeout(() => void fetchStaff(), 0);
+    return () => window.clearTimeout(timeoutId);
+  }, []);
 
   async function handleDelete(id: number, name: string) {
     const confirmed = window.confirm(

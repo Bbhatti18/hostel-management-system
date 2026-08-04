@@ -1,194 +1,40 @@
 "use client";
 
-type NoticePriority = "Low" | "Medium" | "High" | "Emergency";
-type ReadStatus = "Read" | "Unread";
+import Link from "next/link";
+import { useCallback, useEffect, useState } from "react";
+import { supabase } from "@/lib/supabase";
+import { resolveAuthenticatedResident } from "@/lib/residentPortalAuth";
 
-type ResidentNotice = {
-  id: string;
-  title: string;
-  description: string;
-  publishDate: string;
-  expiryDate: string;
-  priority: NoticePriority;
-  readStatus: ReadStatus;
-  pinned: boolean;
-};
-
-const notices: ResidentNotice[] = [
-  {
-    id: "1",
-    title: "Monthly Rent Reminder",
-    description:
-      "Please pay your monthly rent before the due date shown on your bill.",
-    publishDate: "2026-08-01",
-    expiryDate: "2026-08-10",
-    priority: "High",
-    readStatus: "Unread",
-    pinned: true,
-  },
-  {
-    id: "2",
-    title: "Room Inspection Schedule",
-    description:
-      "Routine room inspections will be conducted this week. Please keep your room accessible.",
-    publishDate: "2026-08-02",
-    expiryDate: "2026-08-08",
-    priority: "Medium",
-    readStatus: "Read",
-    pinned: false,
-  },
-  {
-    id: "3",
-    title: "Water Supply Maintenance",
-    description:
-      "Water supply may remain temporarily unavailable due to maintenance work.",
-    publishDate: "2026-08-03",
-    expiryDate: "2026-08-03",
-    priority: "Emergency",
-    readStatus: "Unread",
-    pinned: false,
-  },
-];
-
-function priorityClass(priority: NoticePriority) {
-  if (priority === "Emergency") {
-    return "bg-red-100 text-red-700";
-  }
-
-  if (priority === "High") {
-    return "bg-orange-100 text-orange-700";
-  }
-
-  if (priority === "Medium") {
-    return "bg-amber-100 text-amber-700";
-  }
-
-  return "bg-slate-100 text-slate-700";
-}
-
-function readClass(status: ReadStatus) {
-  return status === "Read"
-    ? "bg-emerald-100 text-emerald-700"
-    : "bg-blue-100 text-blue-700";
-}
+type Notice = { id: string; title: string; description: string; notice_type: string | null; target_audience: string | null; audience: string | null; resident_id: string | null; room_id: string | null; priority: string | null; status: string | null; publish_date: string | null; expiry_date: string | null; is_active: boolean | null; pinned: boolean | null };
+const text = (value: unknown) => value == null ? "" : String(value);
+const normalized = (value: unknown) => text(value).trim().toLowerCase();
+const today = () => new Date().toISOString().slice(0, 10);
 
 export default function ResidentNoticesPage() {
-  return (
-    <main className="min-h-screen bg-slate-50 p-4 sm:p-6 lg:p-8">
-      <div className="mx-auto max-w-5xl space-y-6">
-        <section className="rounded-3xl border border-slate-200 bg-white p-6 shadow-sm">
-          <p className="text-sm font-semibold uppercase tracking-[0.2em] text-indigo-600">
-            Hostel Management System
-          </p>
+  const [notices, setNotices] = useState<Notice[]>([]); const [loading, setLoading] = useState(true); const [error, setError] = useState("");
+  const load = useCallback(async () => {
+    setLoading(true); setError("");
+    const auth = await resolveAuthenticatedResident();
+    if (!auth.resident) { setError(auth.error || "Your resident profile could not be verified."); setLoading(false); return; }
+    const [noticeResult, admissionResult] = await Promise.all([
+      supabase.from("notices").select("id,title,description,notice_type,target_audience,audience,resident_id,room_id,priority,status,publish_date,expiry_date,is_active,pinned").eq("status", "Published").order("pinned", { ascending: false }).order("publish_date", { ascending: false }),
+      supabase.from("admissions").select("room_id,status").eq("resident_id", auth.resident.id).ilike("status", "Active").order("created_at", { ascending: false }).limit(1).maybeSingle(),
+    ]);
+    if (noticeResult.error || admissionResult.error) { setError("Your notices could not be loaded. Please refresh and try again."); setLoading(false); return; }
+    const roomId = text(admissionResult.data?.room_id); const currentDate = today();
+    const visible = ((noticeResult.data ?? []) as Notice[]).filter((notice) => {
+      if (normalized(notice.status) !== "published" || notice.is_active === false) return false;
+      if (notice.publish_date && notice.publish_date > currentDate) return false;
+      if (notice.expiry_date && notice.expiry_date < currentDate) return false;
+      const audience = normalized(notice.audience); const target = normalized(notice.target_audience);
+      if (audience === "all residents" || (target === "all" && !["specific resident", "specific room", "staff", "internal", "admin"].includes(audience))) return true;
+      if (audience === "specific resident") return notice.resident_id === auth.resident.id;
+      if (audience === "specific room") return Boolean(roomId) && notice.room_id === roomId;
+      return false;
+    });
+    setNotices(visible); setLoading(false);
+  }, []);
+  useEffect(() => { const timeout = window.setTimeout(() => void load(), 0); return () => window.clearTimeout(timeout); }, [load]);
 
-          <h1 className="mt-2 text-3xl font-bold text-slate-900">
-            Resident Notices
-          </h1>
-
-          <p className="mt-1 text-sm text-slate-500">
-            View hostel announcements, reminders and emergency updates.
-          </p>
-        </section>
-
-        <section className="grid gap-4 sm:grid-cols-3">
-          <StatCard
-            label="Total Notices"
-            value={String(notices.length)}
-          />
-
-          <StatCard
-            label="Unread"
-            value={String(
-              notices.filter((notice) => notice.readStatus === "Unread").length
-            )}
-          />
-
-          <StatCard
-            label="Emergency"
-            value={String(
-              notices.filter((notice) => notice.priority === "Emergency").length
-            )}
-          />
-        </section>
-
-        <section className="space-y-4">
-          {notices.map((notice) => (
-            <article
-              key={notice.id}
-              className="rounded-3xl border border-slate-200 bg-white p-6 shadow-sm"
-            >
-              <div className="flex flex-col gap-4 sm:flex-row sm:items-start sm:justify-between">
-                <div>
-                  <div className="flex flex-wrap items-center gap-2">
-                    {notice.pinned && (
-                      <span title="Pinned" className="text-lg">
-                        ð
-                      </span>
-                    )}
-
-                    <h2 className="text-xl font-bold text-slate-900">
-                      {notice.title}
-                    </h2>
-                  </div>
-
-                  <p className="mt-3 text-sm leading-6 text-slate-600">
-                    {notice.description}
-                  </p>
-                </div>
-
-                <div className="flex flex-wrap gap-2">
-                  <span
-                    className={`rounded-full px-3 py-1 text-xs font-bold ${priorityClass(
-                      notice.priority
-                    )}`}
-                  >
-                    {notice.priority}
-                  </span>
-
-                  <span
-                    className={`rounded-full px-3 py-1 text-xs font-bold ${readClass(
-                      notice.readStatus
-                    )}`}
-                  >
-                    {notice.readStatus}
-                  </span>
-                </div>
-              </div>
-
-              <div className="mt-5 grid gap-3 rounded-2xl bg-slate-50 p-4 text-sm text-slate-600 sm:grid-cols-2">
-                <p>
-                  <span className="font-semibold text-slate-800">
-                    Publish Date:
-                  </span>{" "}
-                  {notice.publishDate}
-                </p>
-
-                <p>
-                  <span className="font-semibold text-slate-800">
-                    Expiry Date:
-                  </span>{" "}
-                  {notice.expiryDate}
-                </p>
-              </div>
-            </article>
-          ))}
-        </section>
-      </div>
-    </main>
-  );
-}
-
-function StatCard({
-  label,
-  value,
-}: {
-  label: string;
-  value: string;
-}) {
-  return (
-    <article className="rounded-2xl border border-slate-200 bg-white p-5 shadow-sm">
-      <p className="text-sm font-medium text-slate-500">{label}</p>
-      <p className="mt-2 text-2xl font-bold text-slate-900">{value}</p>
-    </article>
-  );
+  return <main className="min-h-screen bg-slate-50 p-4 sm:p-6 lg:p-8"><div className="mx-auto max-w-5xl space-y-6"><section className="rounded-3xl border border-slate-200 bg-white p-6 shadow-sm"><p className="text-sm font-semibold uppercase tracking-[0.2em] text-indigo-600">StayHub Resident Portal</p><h1 className="mt-2 text-3xl font-bold">Notices</h1><p className="mt-1 text-sm text-slate-500">Published hostel announcements intended for you or your room.</p><Link href="/resident-portal" className="mt-4 inline-flex text-sm font-semibold text-indigo-700">Back to portal</Link></section>{error && <p className="rounded-2xl border border-red-200 bg-red-50 p-4 text-sm font-medium text-red-700">{error}</p>}<section className="space-y-4">{loading ? <p className="rounded-3xl bg-white p-10 text-center text-slate-500">Loading notices...</p> : notices.length === 0 ? <p className="rounded-3xl bg-white p-10 text-center text-slate-500">No current notices are available.</p> : notices.map((notice) => <article key={notice.id} className="rounded-3xl border border-slate-200 bg-white p-6 shadow-sm"><div className="flex flex-wrap items-start justify-between gap-3"><div>{notice.pinned && <p className="text-xs font-bold uppercase text-indigo-600">Pinned Notice</p>}<h2 className="mt-1 text-xl font-bold">{notice.title}</h2></div><span className="rounded-full bg-indigo-100 px-3 py-1 text-xs font-bold text-indigo-700">{notice.priority || notice.notice_type || "General"}</span></div><p className="mt-4 whitespace-pre-wrap text-sm leading-6 text-slate-600">{notice.description}</p><div className="mt-5 grid gap-3 rounded-2xl bg-slate-50 p-4 text-sm sm:grid-cols-2"><p><strong>Published:</strong> {notice.publish_date || "—"}</p><p><strong>Expires:</strong> {notice.expiry_date || "No expiry"}</p></div></article>)}</section></div></main>;
 }

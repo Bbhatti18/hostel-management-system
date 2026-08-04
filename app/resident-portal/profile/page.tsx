@@ -2,10 +2,11 @@
 
 import { useEffect, useState } from "react";
 import Link from "next/link";
+import Image from "next/image";
 import { supabase } from "@/lib/supabase";
 import {
-  getResidentPortalSession,
-} from "@/lib/residentPortalSession";
+  resolveAuthenticatedResident,
+} from "@/lib/residentPortalAuth";
 
 type Resident = {
   id: string;
@@ -46,9 +47,10 @@ export default function ResidentProfilePage() {
 
   useEffect(() => {
     async function loadProfile() {
-      const session = getResidentPortalSession();
+      const authenticated = await resolveAuthenticatedResident();
 
-      if (!session) {
+      if (!authenticated.resident) {
+        setError(authenticated.error ?? "Please sign in to access your profile.");
         setSessionMissing(true);
         setLoading(false);
         return;
@@ -57,11 +59,11 @@ export default function ResidentProfilePage() {
       const { data, error: profileError } = await supabase
         .from("residents")
         .select("*")
-        .eq("id", session.residentId)
+        .eq("id", authenticated.resident.id)
         .maybeSingle();
 
       if (profileError) {
-        setError(profileError.message);
+        setError("Your resident profile could not be loaded. Please try again.");
       } else if (!data) {
         setError("Resident profile was not found.");
       } else {
@@ -135,9 +137,12 @@ export default function ResidentProfilePage() {
             <div className="flex flex-col gap-6 md:flex-row">
               <div className="flex h-28 w-28 shrink-0 items-center justify-center overflow-hidden rounded-3xl bg-indigo-100 text-4xl font-bold text-indigo-700">
                 {resident.photo_url ? (
-                  <img
+                  <Image
                     src={resident.photo_url}
                     alt={residentName(resident)}
+                    width={112}
+                    height={112}
+                    unoptimized
                     className="h-full w-full object-cover"
                   />
                 ) : (

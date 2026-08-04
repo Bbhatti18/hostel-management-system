@@ -20,10 +20,6 @@ export default function VisitorsPage() {
   const [visitors, setVisitors] = useState<Visitor[]>([]);
   const [loading, setLoading] = useState(true);
 
-  useEffect(() => {
-    fetchVisitors();
-  }, []);
-
   async function fetchVisitors() {
     const { data, error } = await supabase
       .from("visitors")
@@ -47,6 +43,11 @@ export default function VisitorsPage() {
 
     setLoading(false);
   }
+
+  useEffect(() => {
+    const timeoutId = window.setTimeout(() => void fetchVisitors(), 0);
+    return () => window.clearTimeout(timeoutId);
+  }, []);
 async function handleCheckout(id: number) {
   const { error } = await supabase
     .from("visitors")

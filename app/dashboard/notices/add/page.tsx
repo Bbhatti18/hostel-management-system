@@ -242,7 +242,8 @@ export default function AddNoticePage() {
   };
 
   useEffect(() => {
-    void loadFormData();
+    const timeoutId = window.setTimeout(() => void loadFormData(), 0);
+    return () => window.clearTimeout(timeoutId);
   }, []);
 
   const handleAudienceChange = (

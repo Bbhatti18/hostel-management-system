@@ -253,7 +253,7 @@ export default function RolesSettingsPage() {
                 </h3>
 
                 <p className="mt-2 text-sm text-slate-600">
-                  Assign permissions based on each staff member's
+                  Assign permissions based on each staff member&apos;s
                   responsibilities.
                 </p>
 

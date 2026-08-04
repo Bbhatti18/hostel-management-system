@@ -1,58 +1,73 @@
 "use client";
 
+import Link from "next/link";
 import {
-  ChangeEvent,
-  FormEvent,
+  type ChangeEvent,
+  type FormEvent,
   useCallback,
   useEffect,
   useMemo,
   useState,
 } from "react";
 import { supabase } from "@/lib/supabase";
-import { getResidentPortalSession } from "@/lib/residentPortalSession";
+import {
+  resolveAuthenticatedResident,
+  type AuthenticatedResident,
+} from "@/lib/residentPortalAuth";
+import { deriveBillStatus, roundMoney } from "@/lib/financials";
+import { getSupabaseErrorMessage } from "@/lib/supabaseErrors";
 
 type GenericRow = Record<string, unknown>;
 
-type PortalSession = {
-  linkId: string;
-  residentId: string;
-  portalEmail: string;
-};
-
-type ReceiptRow = {
+type Bill = {
   id: string;
   resident_id: string;
-  bill_id: string | null;
-  receipt_url: string;
-  reference_number: string | null;
+  bill_number: string;
+  billing_month: string;
+  due_date: string;
+  total_amount: number;
+  bill_status: string;
+  paid: number;
+  outstanding: number;
+  displayStatus: string;
+};
+
+type Payment = {
+  id: string;
+  bill_id: string;
+  resident_id: string;
+  payment_number: string | null;
+  payment_date: string;
   amount: number;
+  payment_method: string;
+  reference_number: string | null;
+  payment_status: string;
+  verified: boolean;
+  notes: string | null;
+};
+
+type Receipt = {
+  id: string;
+  bill_id: string | null;
+  resident_id: string;
+  amount: number;
+  reference_number: string | null;
   status: string;
+  notes: string | null;
   created_at: string;
 };
 
+const MAX_FILE_SIZE = 5 * 1024 * 1024;
+const SAFE_FILE_TYPES = new Set(["application/pdf", "image/jpeg", "image/png"]);
 const inputClass =
-  "w-full rounded-xl border border-slate-300 bg-white px-3 py-2.5 text-sm text-slate-900 outline-none transition focus:border-indigo-500 focus:ring-4 focus:ring-indigo-100";
+  "w-full rounded-xl border border-slate-300 bg-white px-3 py-2.5 text-sm text-slate-900 outline-none focus:border-indigo-500 focus:ring-4 focus:ring-indigo-100 disabled:cursor-not-allowed disabled:bg-slate-100";
 
 function text(value: unknown) {
   return value == null ? "" : String(value);
 }
 
-function firstValue(row: GenericRow | undefined, keys: string[]) {
-  if (!row) return "";
-
-  for (const key of keys) {
-    const value = row[key];
-
-    if (
-      value !== null &&
-      value !== undefined &&
-      String(value).trim() !== ""
-    ) {
-      return String(value);
-    }
-  }
-
-  return "";
+function normalized(value: unknown) {
+  return text(value).trim().toLowerCase();
 }
 
 function money(value: unknown) {
@@ -63,436 +78,328 @@ function money(value: unknown) {
   }).format(Number(value || 0));
 }
 
-function billTotal(row: GenericRow) {
-  const direct = Number(
-    firstValue(row, [
-      "total_amount",
-      "bill_total",
-      "total",
-      "amount",
-      "grand_total",
-    ]) || 0
-  );
-
-  if (direct > 0) return direct;
-
-  return (
-    Number(firstValue(row, ["rent_amount", "rent"]) || 0) +
-    Number(firstValue(row, ["electricity_amount", "electricity"]) || 0) +
-    Number(firstValue(row, ["ac_amount", "ac_charges", "ac"]) || 0) +
-    Number(firstValue(row, ["other_amount", "other_charges", "other"]) || 0)
-  );
+function monthLabel(value: string) {
+  const parsed = new Date(`${value.slice(0, 7)}-01T00:00:00`);
+  return Number.isNaN(parsed.getTime())
+    ? value
+    : parsed.toLocaleDateString("en-PK", { month: "long", year: "numeric" });
 }
 
-function monthLabel(row: GenericRow) {
-  const direct = firstValue(row, [
-    "month",
-    "billing_month",
-    "bill_month",
-  ]);
+function statusClass(status: string) {
+  const value = normalized(status);
+  if (value === "verified" || value === "paid") return "bg-emerald-100 text-emerald-700";
+  if (value === "rejected" || value === "overdue") return "bg-red-100 text-red-700";
+  if (value === "cancelled") return "bg-slate-200 text-slate-700";
+  if (value === "partially paid") return "bg-blue-100 text-blue-700";
+  return "bg-amber-100 text-amber-700";
+}
 
-  if (direct) return direct;
-
-  const date = firstValue(row, [
-    "due_date",
-    "created_at",
-    "bill_date",
-  ]);
-
-  if (!date) return "Current Bill";
-
-  const parsed = new Date(date);
-
-  if (Number.isNaN(parsed.getTime())) return date;
-
-  return parsed.toLocaleDateString("en-PK", {
-    month: "long",
-    year: "numeric",
-  });
+function firstText(row: GenericRow | undefined, keys: string[]) {
+  if (!row) return "";
+  for (const key of keys) {
+    const value = row[key];
+    if (value !== null && value !== undefined && text(value).trim()) return text(value);
+  }
+  return "";
 }
 
 export default function ResidentPaymentsPage() {
-  const [session, setSession] = useState<PortalSession | null>(null);
-  const [bills, setBills] = useState<GenericRow[]>([]);
-  const [receipts, setReceipts] = useState<ReceiptRow[]>([]);
+  const [resident, setResident] = useState<AuthenticatedResident | null>(null);
+  const [bills, setBills] = useState<Bill[]>([]);
+  const [payments, setPayments] = useState<Payment[]>([]);
+  const [receipts, setReceipts] = useState<Receipt[]>([]);
   const [selectedBillId, setSelectedBillId] = useState("");
+  const [amount, setAmount] = useState("");
+  const [paymentMethod, setPaymentMethod] = useState("");
   const [referenceNumber, setReferenceNumber] = useState("");
-  const [manualAmount, setManualAmount] = useState("");
+  const [notes, setNotes] = useState("");
   const [selectedFile, setSelectedFile] = useState<File | null>(null);
   const [loading, setLoading] = useState(true);
   const [uploading, setUploading] = useState(false);
   const [message, setMessage] = useState("");
   const [error, setError] = useState("");
 
-  const loadData = useCallback(async (portalSession: PortalSession) => {
+  const loadData = useCallback(async () => {
     setLoading(true);
     setError("");
 
-    const [billsResult, receiptsResult] = await Promise.all([
-      supabase
-        .from("bills")
-        .select("*")
-        .eq("resident_id", portalSession.residentId)
-        .order("created_at", { ascending: false }),
-      supabase
-        .from("payment_receipts")
-        .select("*")
-        .eq("resident_id", portalSession.residentId)
-        .order("created_at", { ascending: false }),
-    ]);
-
-    if (billsResult.error) {
-      setError(billsResult.error.message);
-    } else {
-      setBills((billsResult.data ?? []) as GenericRow[]);
-    }
-
-    if (receiptsResult.error) {
-      setError((current) =>
-        current
-          ? `${current} | ${receiptsResult.error?.message}`
-          : receiptsResult.error?.message || ""
-      );
-    } else {
-      setReceipts((receiptsResult.data ?? []) as ReceiptRow[]);
-    }
-
-    setLoading(false);
-  }, []);
-
-  useEffect(() => {
-    const portalSession =
-      getResidentPortalSession() as PortalSession | null;
-
-    if (!portalSession) {
-      setError("Please login to the Resident Portal first.");
+    const resolved = await resolveAuthenticatedResident();
+    if (!resolved.resident) {
+      setResident(null);
+      setError(resolved.error ?? "Your resident profile could not be verified.");
       setLoading(false);
       return;
     }
 
-    setSession(portalSession);
-    void loadData(portalSession);
+    const residentId = resolved.resident.id;
+    const [billsResult, paymentsResult, receiptsResult] = await Promise.all([
+      supabase.from("bills").select("*").eq("resident_id", residentId).order("billing_month", { ascending: false }),
+      supabase.from("payments").select("*").eq("resident_id", residentId).order("created_at", { ascending: false }),
+      supabase.from("payment_receipts").select("id, bill_id, resident_id, amount, reference_number, status, notes, created_at").eq("resident_id", residentId).order("created_at", { ascending: false }),
+    ]);
+
+    const loadError = billsResult.error || paymentsResult.error || receiptsResult.error;
+    if (loadError) {
+      setError(getSupabaseErrorMessage(loadError, "Your financial records could not be loaded. Please try again."));
+      setLoading(false);
+      return;
+    }
+
+    const paymentRows = (paymentsResult.data ?? []) as Payment[];
+    const verifiedByBill = new Map<string, number>();
+    for (const payment of paymentRows) {
+      if (normalized(payment.payment_status) !== "verified") continue;
+      verifiedByBill.set(payment.bill_id, roundMoney((verifiedByBill.get(payment.bill_id) ?? 0) + Number(payment.amount || 0)));
+    }
+
+    const calculatedBills = ((billsResult.data ?? []) as GenericRow[]).map((row) => {
+      const id = text(row.id);
+      const paid = verifiedByBill.get(id) ?? 0;
+      const total = Number(row.total_amount || 0);
+      const cancelled = normalized(row.bill_status) === "cancelled";
+      return {
+        id,
+        resident_id: text(row.resident_id),
+        bill_number: firstText(row, ["bill_number"]) || "Bill",
+        billing_month: firstText(row, ["billing_month"]),
+        due_date: firstText(row, ["due_date"]),
+        total_amount: total,
+        bill_status: firstText(row, ["bill_status"]),
+        paid,
+        outstanding: Math.max(roundMoney(total - paid), 0),
+        displayStatus: cancelled ? "Cancelled" : deriveBillStatus(total, paid, firstText(row, ["due_date"]), firstText(row, ["bill_status"])),
+      } as Bill;
+    });
+
+    setResident(resolved.resident);
+    setBills(calculatedBills);
+    setPayments(paymentRows);
+    setReceipts((receiptsResult.data ?? []) as Receipt[]);
+    setLoading(false);
+  }, []);
+
+  useEffect(() => {
+    const timeoutId = window.setTimeout(() => void loadData(), 0);
+    return () => window.clearTimeout(timeoutId);
   }, [loadData]);
 
   const selectedBill = useMemo(
-    () =>
-      bills.find((bill) => text(bill.id) === selectedBillId),
-    [bills, selectedBillId]
+    () => bills.find((bill) => bill.id === selectedBillId),
+    [bills, selectedBillId],
   );
 
+  const summary = useMemo(() => {
+    const operationalBills = bills.filter((bill) => normalized(bill.displayStatus) !== "cancelled");
+    return {
+      outstanding: operationalBills.reduce((sum, bill) => sum + bill.outstanding, 0),
+      pendingBills: operationalBills.filter((bill) => bill.outstanding > 0).length,
+      overdueBills: operationalBills.filter((bill) => normalized(bill.displayStatus) === "overdue").length,
+      verifiedPayments: payments.filter((payment) => normalized(payment.payment_status) === "verified").reduce((sum, payment) => sum + Number(payment.amount || 0), 0),
+      pendingReceipts: receipts.filter((receipt) => normalized(receipt.status) === "pending verification").length,
+    };
+  }, [bills, payments, receipts]);
+
+  function selectBill(billId: string) {
+    const bill = bills.find((item) => item.id === billId);
+    setSelectedBillId(billId);
+    setAmount(bill ? String(bill.outstanding) : "");
+  }
+
   function handleFileChange(event: ChangeEvent<HTMLInputElement>) {
-    setSelectedFile(event.target.files?.[0] ?? null);
+    const file = event.target.files?.[0] ?? null;
     setMessage("");
     setError("");
+    if (!file) {
+      setSelectedFile(null);
+      return;
+    }
+    if (!SAFE_FILE_TYPES.has(file.type)) {
+      setSelectedFile(null);
+      event.target.value = "";
+      setError("Receipt files must be PDF, JPEG, or PNG.");
+      return;
+    }
+    if (file.size > MAX_FILE_SIZE) {
+      setSelectedFile(null);
+      event.target.value = "";
+      setError("Receipt files must not exceed 5 MB.");
+      return;
+    }
+    setSelectedFile(file);
   }
 
   async function uploadReceipt(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
-
-    if (!session) {
-      setError("Resident Portal session not found. Please login again.");
-      return;
-    }
-
-    if (!selectedFile) {
-      setError("Please choose a receipt image or PDF.");
-      return;
-    }
+    if (uploading) return;
 
     setUploading(true);
     setMessage("");
     setError("");
 
-    const safeName = selectedFile.name.replace(/[^a-zA-Z0-9._-]/g, "_");
-    const filePath = `${session.residentId}/${Date.now()}-${safeName}`;
+    if (!selectedBillId || !paymentMethod.trim() || !selectedFile) {
+      setError("Bill, payment method, and receipt file are required.");
+      setUploading(false);
+      return;
+    }
+    const submittedAmount = roundMoney(Number(amount));
+    if (!Number.isFinite(submittedAmount) || submittedAmount <= 0) {
+      setError("Payment amount must be greater than zero.");
+      setUploading(false);
+      return;
+    }
+    if (!SAFE_FILE_TYPES.has(selectedFile.type) || selectedFile.size > MAX_FILE_SIZE) {
+      setError("Receipt files must be PDF, JPEG, or PNG and no larger than 5 MB.");
+      setUploading(false);
+      return;
+    }
 
+    const resolved = await resolveAuthenticatedResident();
+    if (!resolved.resident) {
+      setError(resolved.error ?? "Your resident profile could not be verified.");
+      setUploading(false);
+      return;
+    }
+    const residentId = resolved.resident.id;
+    const { data: currentBill, error: billError } = await supabase
+      .from("bills")
+      .select("id, resident_id, total_amount, bill_status")
+      .eq("id", selectedBillId)
+      .eq("resident_id", residentId)
+      .maybeSingle();
+    if (billError || !currentBill) {
+      setError("The selected bill could not be verified. Refresh and try again.");
+      setUploading(false);
+      return;
+    }
+    if (normalized(currentBill.bill_status) === "cancelled") {
+      setError("Receipts cannot be submitted for a cancelled bill.");
+      setUploading(false);
+      return;
+    }
+
+    const { data: verifiedRows, error: paymentError } = await supabase
+      .from("payments")
+      .select("amount")
+      .eq("resident_id", residentId)
+      .eq("bill_id", selectedBillId)
+      .eq("payment_status", "Verified");
+    if (paymentError) {
+      setError("The current outstanding balance could not be verified. Please try again.");
+      setUploading(false);
+      return;
+    }
+    const verifiedPaid = roundMoney((verifiedRows ?? []).reduce((sum, row) => sum + Number(row.amount || 0), 0));
+    const outstanding = Math.max(roundMoney(Number(currentBill.total_amount || 0) - verifiedPaid), 0);
+    if (submittedAmount > outstanding) {
+      setError(`Amount cannot exceed the current outstanding balance of ${money(outstanding)}.`);
+      setUploading(false);
+      return;
+    }
+
+    const reference = referenceNumber.trim();
+    if (reference) {
+      const [paymentReference, receiptReference] = await Promise.all([
+        supabase.from("payments").select("id").eq("resident_id", residentId).eq("reference_number", reference).limit(1),
+        supabase.from("payment_receipts").select("id").eq("resident_id", residentId).eq("reference_number", reference).limit(1),
+      ]);
+      if (paymentReference.error || receiptReference.error) {
+        setError("The payment reference could not be checked. Please try again.");
+        setUploading(false);
+        return;
+      }
+      if ((paymentReference.data ?? []).length || (receiptReference.data ?? []).length) {
+        setError("This reference number has already been submitted.");
+        setUploading(false);
+        return;
+      }
+    }
+
+    const safeName = selectedFile.name.replace(/[^a-zA-Z0-9._-]/g, "_");
+    const filePath = `${residentId}/${Date.now()}-${safeName}`;
     const { error: uploadError } = await supabase.storage
       .from("payment-receipts")
-      .upload(filePath, selectedFile, {
-        cacheControl: "3600",
-        upsert: false,
-      });
-
+      .upload(filePath, selectedFile, { cacheControl: "3600", upsert: false });
     if (uploadError) {
-      setError(uploadError.message);
+      setError(getSupabaseErrorMessage(uploadError, "The receipt file could not be uploaded. Please try again."));
       setUploading(false);
       return;
     }
 
-    const { data: publicUrlData } = supabase.storage
-      .from("payment-receipts")
-      .getPublicUrl(filePath);
-
-    const amount = selectedBill
-      ? billTotal(selectedBill)
-      : Number(manualAmount) || 0;
-
-    if (amount <= 0) {
-      await supabase.storage
-        .from("payment-receipts")
-        .remove([filePath]);
-
-      setError("Please enter a valid payment amount.");
-      setUploading(false);
-      return;
-    }
-
-    const { error: insertError } = await supabase
-      .from("payment_receipts")
-      .insert({
-        resident_id: session.residentId,
-        bill_id: selectedBillId || null,
-        receipt_url: publicUrlData.publicUrl,
-        reference_number: referenceNumber.trim() || null,
-        amount,
-        status: "Pending Verification",
-        created_at: new Date().toISOString(),
-        updated_at: new Date().toISOString(),
-      });
-
+    const { data: urlData } = supabase.storage.from("payment-receipts").getPublicUrl(filePath);
+    const receiptNotes = [`Payment method: ${paymentMethod.trim()}`, notes.trim()].filter(Boolean).join("\n");
+    const { error: insertError } = await supabase.from("payment_receipts").insert({
+      resident_id: residentId,
+      bill_id: selectedBillId,
+      receipt_url: urlData.publicUrl,
+      original_file_name: selectedFile.name,
+      reference_number: reference || null,
+      amount: submittedAmount,
+      status: "Pending Verification",
+      verified: false,
+      notes: receiptNotes || null,
+      uploaded_at: new Date().toISOString(),
+      updated_at: new Date().toISOString(),
+    });
     if (insertError) {
-      await supabase.storage
-        .from("payment-receipts")
-        .remove([filePath]);
-
-      setError(insertError.message);
+      setError("The receipt file was uploaded, but the submission could not be linked to your bill. It was not marked complete; please contact an administrator for review.");
       setUploading(false);
       return;
     }
 
-    setMessage("Payment receipt uploaded successfully.");
-    setSelectedFile(null);
-    setReferenceNumber("");
-    setManualAmount("");
+    setMessage("Receipt submitted for verification. Your balance will change only after admin approval.");
     setSelectedBillId("");
-    await loadData(session);
+    setAmount("");
+    setPaymentMethod("");
+    setReferenceNumber("");
+    setNotes("");
+    setSelectedFile(null);
+    const input = document.getElementById("payment-receipt-file") as HTMLInputElement | null;
+    if (input) input.value = "";
+    await loadData();
     setUploading(false);
-
-    const fileInput = document.getElementById(
-      "payment-receipt-file"
-    ) as HTMLInputElement | null;
-
-    if (fileInput) fileInput.value = "";
   }
 
   return (
     <main className="min-h-screen bg-slate-50 p-4 sm:p-6 lg:p-8">
-      <div className="mx-auto max-w-6xl space-y-6">
+      <div className="mx-auto max-w-7xl space-y-6">
         <section className="rounded-3xl border border-slate-200 bg-white p-6 shadow-sm">
-          <p className="text-sm font-semibold uppercase tracking-[0.2em] text-indigo-600">
-            Hostel Management System
-          </p>
-
-          <h1 className="mt-2 text-3xl font-bold text-slate-900">
-            Resident Payments
-          </h1>
-
-          <p className="mt-1 text-sm text-slate-500">
-            View bills and upload payment receipts for admin verification.
-          </p>
+          <p className="text-sm font-semibold uppercase tracking-[0.2em] text-indigo-600">StayHub</p>
+          <h1 className="mt-2 text-3xl font-bold text-slate-900">Payments & Receipts</h1>
+          <p className="mt-1 text-sm text-slate-500">{resident ? `Financial activity for ${resident.full_name ?? "Resident"}.` : "Submit receipts and review verification history."}</p>
+          <div className="mt-4 flex gap-3"><Link href="/resident-portal" className="rounded-xl border border-slate-300 px-4 py-2 text-sm font-semibold">Portal Home</Link><Link href="/resident-portal/bills" className="rounded-xl bg-indigo-600 px-4 py-2 text-sm font-semibold text-white">My Bills</Link></div>
         </section>
 
-        {(message || error) && (
-          <section
-            className={`rounded-2xl border px-4 py-3 text-sm font-medium ${
-              error
-                ? "border-red-200 bg-red-50 text-red-700"
-                : "border-emerald-200 bg-emerald-50 text-emerald-700"
-            }`}
-          >
-            {error || message}
-          </section>
-        )}
+        {(message || error) && <section className={`rounded-2xl border px-4 py-3 text-sm font-medium ${error ? "border-red-200 bg-red-50 text-red-700" : "border-emerald-200 bg-emerald-50 text-emerald-700"}`}>{error || message}</section>}
+
+        <section className="grid gap-4 sm:grid-cols-2 xl:grid-cols-5">
+          {[['Total Outstanding', money(summary.outstanding)], ['Current Pending Bills', String(summary.pendingBills)], ['Overdue Bills', String(summary.overdueBills)], ['Verified Payments', money(summary.verifiedPayments)], ['Pending Verification', String(summary.pendingReceipts)]].map(([label, value]) => <article key={label} className="rounded-2xl border border-slate-200 bg-white p-5 shadow-sm"><p className="text-sm text-slate-500">{label}</p><p className="mt-2 text-2xl font-bold">{value}</p></article>)}
+        </section>
 
         <section className="rounded-3xl border border-slate-200 bg-white p-6 shadow-sm">
-          <h2 className="text-xl font-bold text-slate-900">
-            Upload Payment Receipt
-          </h2>
-
-          <form
-            onSubmit={uploadReceipt}
-            className="mt-5 grid gap-4 md:grid-cols-2"
-          >
-            <label>
-              <span className="mb-2 block text-sm font-semibold text-slate-700">
-                Select Bill *
-              </span>
-
-              <select
-                value={selectedBillId}
-                onChange={(event) =>
-                  setSelectedBillId(event.target.value)
-                }
-                className={inputClass}
-                disabled={loading}
-              >
-                <option value="">No bill / Manual payment</option>
-
-                {bills.map((bill) => (
-                  <option key={text(bill.id)} value={text(bill.id)}>
-                    {monthLabel(bill)} â {money(billTotal(bill))}
-                  </option>
-                ))}
-              </select>
-            </label>
-
-            <label>
-              <span className="mb-2 block text-sm font-semibold text-slate-700">
-                Payment Reference
-              </span>
-
-              <input
-                value={referenceNumber}
-                onChange={(event) =>
-                  setReferenceNumber(event.target.value)
-                }
-                className={inputClass}
-                placeholder="Bank reference or transaction ID"
-              />
-            </label>
-
-            {!selectedBillId && (
-              <label>
-                <span className="mb-2 block text-sm font-semibold text-slate-700">
-                  Payment Amount *
-                </span>
-
-                <input
-                  type="number"
-                  min="1"
-                  value={manualAmount}
-                  onChange={(event) =>
-                    setManualAmount(event.target.value)
-                  }
-                  className={inputClass}
-                  placeholder="17500"
-                />
-              </label>
-            )}
-
-            <label className="md:col-span-2">
-              <span className="mb-2 block text-sm font-semibold text-slate-700">
-                Receipt File *
-              </span>
-
-              <input
-                id="payment-receipt-file"
-                type="file"
-                accept="image/*,.pdf"
-                onChange={handleFileChange}
-                className={inputClass}
-              />
-            </label>
-
-            <div className="md:col-span-2">
-              <button
-                type="submit"
-                disabled={uploading}
-                className="rounded-xl bg-indigo-600 px-5 py-3 text-sm font-semibold text-white hover:bg-indigo-700 disabled:cursor-not-allowed disabled:opacity-60"
-              >
-                {uploading ? "Uploading..." : "Upload Receipt"}
-              </button>
-            </div>
+          <h2 className="text-xl font-bold">Upload Payment Receipt</h2>
+          <p className="mt-1 text-sm text-slate-500">PDF, JPEG, or PNG; maximum 5 MB. Submission remains pending until verified.</p>
+          <form onSubmit={uploadReceipt} className="mt-5 grid gap-4 md:grid-cols-2">
+            <label><span className="mb-2 block text-sm font-semibold">Bill *</span><select required value={selectedBillId} onChange={(event) => selectBill(event.target.value)} disabled={loading || uploading} className={inputClass}><option value="">Select an outstanding bill</option>{bills.filter((bill) => normalized(bill.displayStatus) !== "cancelled" && bill.outstanding > 0).map((bill) => <option key={bill.id} value={bill.id}>{bill.bill_number} — {monthLabel(bill.billing_month)} — {money(bill.outstanding)}</option>)}</select></label>
+            <label><span className="mb-2 block text-sm font-semibold">Amount *</span><input required type="number" min="0.01" step="0.01" max={selectedBill?.outstanding} value={amount} onChange={(event) => setAmount(event.target.value)} disabled={uploading} className={inputClass} /></label>
+            <label><span className="mb-2 block text-sm font-semibold">Payment Method *</span><input required value={paymentMethod} onChange={(event) => setPaymentMethod(event.target.value)} disabled={uploading} className={inputClass} placeholder="Cash deposit, bank transfer, card, etc." /></label>
+            <label><span className="mb-2 block text-sm font-semibold">Reference Number</span><input value={referenceNumber} onChange={(event) => setReferenceNumber(event.target.value)} disabled={uploading} className={inputClass} placeholder="Transaction reference" /></label>
+            <label className="md:col-span-2"><span className="mb-2 block text-sm font-semibold">Receipt File *</span><input id="payment-receipt-file" required type="file" accept="application/pdf,image/jpeg,image/png,.pdf,.jpg,.jpeg,.png" onChange={handleFileChange} disabled={uploading} className={inputClass} /></label>
+            <label className="md:col-span-2"><span className="mb-2 block text-sm font-semibold">Notes</span><textarea value={notes} onChange={(event) => setNotes(event.target.value)} disabled={uploading} className={`${inputClass} min-h-24`} /></label>
+            <div className="md:col-span-2"><button type="submit" disabled={uploading || loading} className="rounded-xl bg-indigo-600 px-5 py-3 text-sm font-semibold text-white disabled:opacity-60">{uploading ? "Submitting..." : "Submit for Verification"}</button></div>
           </form>
         </section>
 
-        <section className="rounded-3xl border border-slate-200 bg-white shadow-sm">
-          <div className="border-b border-slate-200 p-5">
-            <h2 className="text-xl font-bold text-slate-900">
-              Receipt History
-            </h2>
-          </div>
-
-          <div className="overflow-x-auto">
-            <table className="min-w-full divide-y divide-slate-200">
-              <thead className="bg-slate-50">
-                <tr>
-                  {[
-                    "Date",
-                    "Bill",
-                    "Amount",
-                    "Reference",
-                    "Status",
-                    "Receipt",
-                  ].map((heading) => (
-                    <th
-                      key={heading}
-                      className="px-5 py-3 text-left text-xs font-bold uppercase tracking-wider text-slate-500"
-                    >
-                      {heading}
-                    </th>
-                  ))}
-                </tr>
-              </thead>
-
-              <tbody className="divide-y divide-slate-100 bg-white">
-                {loading ? (
-                  <tr>
-                    <td
-                      colSpan={6}
-                      className="px-5 py-12 text-center text-sm text-slate-500"
-                    >
-                      Loading payment information...
-                    </td>
-                  </tr>
-                ) : receipts.length === 0 ? (
-                  <tr>
-                    <td
-                      colSpan={6}
-                      className="px-5 py-12 text-center text-sm text-slate-500"
-                    >
-                      No payment receipts uploaded yet.
-                    </td>
-                  </tr>
-                ) : (
-                  receipts.map((receipt) => {
-                    const bill = bills.find(
-                      (item) => text(item.id) === receipt.bill_id
-                    );
-
-                    return (
-                      <tr key={receipt.id}>
-                        <td className="px-5 py-4 text-sm text-slate-700">
-                          {receipt.created_at.slice(0, 10)}
-                        </td>
-
-                        <td className="px-5 py-4 text-sm text-slate-700">
-                          {bill ? monthLabel(bill) : "Bill"}
-                        </td>
-
-                        <td className="px-5 py-4 text-sm font-semibold text-slate-900">
-                          {money(receipt.amount)}
-                        </td>
-
-                        <td className="px-5 py-4 text-sm text-slate-700">
-                          {receipt.reference_number || "â"}
-                        </td>
-
-                        <td className="px-5 py-4">
-                          <span className="rounded-full bg-amber-100 px-3 py-1 text-xs font-bold text-amber-700">
-                            {receipt.status}
-                          </span>
-                        </td>
-
-                        <td className="px-5 py-4">
-                          <a
-                            href={receipt.receipt_url}
-                            target="_blank"
-                            rel="noreferrer"
-                            className="rounded-lg border border-slate-200 px-3 py-2 text-xs font-semibold text-slate-700"
-                          >
-                            Open
-                          </a>
-                        </td>
-                      </tr>
-                    );
-                  })
-                )}
-              </tbody>
-            </table>
-          </div>
-        </section>
+        <HistoryTable title="Payment History" headers={["Payment", "Bill", "Date", "Amount", "Method", "Reference", "Status", "Verification", "Notes"]} loading={loading} empty="No payment history found." rows={payments.map((payment) => { const bill = bills.find((item) => item.id === payment.bill_id); return [payment.payment_number ?? "—", bill?.bill_number ?? "Historical bill", payment.payment_date, money(payment.amount), payment.payment_method || "Payment Method", payment.reference_number ?? "—", <Status key="status" value={payment.payment_status} />, payment.verified || normalized(payment.payment_status) === "verified" ? "Verified" : "Not verified", payment.notes ?? "—"]; })} />
+        <HistoryTable title="Receipt History" headers={["Date", "Bill", "Amount", "Reference", "Status", "Notes"]} loading={loading} empty="No receipt submissions found." rows={receipts.map((receipt) => { const bill = bills.find((item) => item.id === receipt.bill_id); return [receipt.created_at.slice(0, 10), bill?.bill_number ?? "Historical bill", money(receipt.amount), receipt.reference_number ?? "—", <Status key="status" value={receipt.status} />, receipt.notes ?? "—"]; })} />
       </div>
     </main>
   );
+}
+
+function Status({ value }: { value: string }) {
+  return <span className={`inline-flex rounded-full px-3 py-1 text-xs font-bold ${statusClass(value)}`}>{value}</span>;
+}
+
+function HistoryTable({ title, headers, rows, loading, empty }: { title: string; headers: string[]; rows: React.ReactNode[][]; loading: boolean; empty: string }) {
+  return <section className="rounded-3xl border border-slate-200 bg-white shadow-sm"><div className="border-b border-slate-200 p-5"><h2 className="text-xl font-bold">{title}</h2></div><div className="overflow-x-auto"><table className="min-w-full divide-y divide-slate-200"><thead className="bg-slate-50"><tr>{headers.map((header) => <th key={header} className="px-4 py-3 text-left text-xs font-bold uppercase tracking-wider text-slate-500">{header}</th>)}</tr></thead><tbody className="divide-y divide-slate-100">{loading ? <tr><td colSpan={headers.length} className="px-5 py-10 text-center text-sm text-slate-500">Loading...</td></tr> : rows.length === 0 ? <tr><td colSpan={headers.length} className="px-5 py-10 text-center text-sm text-slate-500">{empty}</td></tr> : rows.map((row, index) => <tr key={`${title}-${index}`}>{row.map((cell, cellIndex) => <td key={`${title}-${index}-${cellIndex}`} className="px-4 py-4 text-sm text-slate-700">{cell}</td>)}</tr>)}</tbody></table></div></section>;
 }

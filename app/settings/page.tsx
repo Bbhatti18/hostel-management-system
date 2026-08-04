@@ -8,6 +8,7 @@ import {
   useState,
 } from "react";
 import { supabase } from "@/lib/supabase";
+import { getSupabaseErrorMessage } from "@/lib/supabaseErrors";
 
 type SettingsForm = {
   hostel_name: string;
@@ -79,7 +80,7 @@ export default function SettingsPage() {
       .maybeSingle();
 
     if (loadError) {
-      setError(loadError.message);
+      setError(getSupabaseErrorMessage(loadError, "Hostel settings could not be loaded."));
     } else if (data) {
       setForm({
         hostel_name: data.hostel_name ?? emptyForm.hostel_name,
@@ -119,7 +120,8 @@ export default function SettingsPage() {
   }, []);
 
   useEffect(() => {
-    void loadSettings();
+    const timeoutId = window.setTimeout(() => void loadSettings(), 0);
+    return () => window.clearTimeout(timeoutId);
   }, [loadSettings]);
 
   function updateField<K extends keyof SettingsForm>(
@@ -188,7 +190,7 @@ export default function SettingsPage() {
       });
 
     if (saveError) {
-      setError(saveError.message);
+      setError(getSupabaseErrorMessage(saveError, "Hostel settings could not be saved."));
     } else {
       setMessage("Settings saved successfully.");
       await loadSettings();

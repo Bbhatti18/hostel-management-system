@@ -8,6 +8,7 @@ import {
   useState,
 } from "react";
 import { supabase } from "@/lib/supabase";
+import { getSupabaseErrorMessage } from "@/lib/supabaseErrors";
 
 type UserRow = {
   id: string;
@@ -89,7 +90,7 @@ export default function AdminProfilePage() {
     }
 
     if (selectedError) {
-      setError(selectedError.message);
+      setError(getSupabaseErrorMessage(selectedError, "The administrator profile could not be loaded."));
     } else if (!selectedProfile) {
       setError(
         "No admin profile found. First create an admin user from Users & Roles."
@@ -108,7 +109,8 @@ export default function AdminProfilePage() {
   }, []);
 
   useEffect(() => {
-    void loadProfile();
+    const timeoutId = window.setTimeout(() => void loadProfile(), 0);
+    return () => window.clearTimeout(timeoutId);
   }, [loadProfile]);
 
   function updateField<K extends keyof ProfileForm>(
@@ -169,7 +171,7 @@ export default function AdminProfilePage() {
       .eq("id", profile.id);
 
     if (updateError) {
-      setError(updateError.message);
+      setError(getSupabaseErrorMessage(updateError, "The administrator profile could not be updated."));
     } else {
       setMessage("Admin profile updated successfully.");
       setEditing(false);

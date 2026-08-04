@@ -10,6 +10,9 @@ import {
   useState,
 } from "react";
 import { supabase } from "@/lib/supabase";
+import Link from "next/link";
+import { getSupabaseErrorMessage } from "@/lib/supabaseErrors";
+import { safeStorageFileName, validateImageFile } from "@/lib/imageValidation";
 
 type GenericRow = Record<string, unknown>;
 
@@ -21,9 +24,10 @@ type MaintenanceRequest = {
   request_number: string;
   resident_id: string | null;
   room_id: string | null;
-  title: string;
-  category: string;
+  title: string | null;
+  category: string | null;
   description: string | null;
+  complaint_description: string | null;
   priority: Priority;
   status: RequestStatus;
   assigned_to: string | null;
@@ -31,6 +35,11 @@ type MaintenanceRequest = {
   actual_cost: number;
   photo_url: string | null;
   completion_date: string | null;
+  completed_at: string | null;
+  assigned_date: string | null;
+  before_photos: unknown;
+  during_photos: unknown;
+  after_photos: unknown;
   notes: string | null;
   created_at: string;
   updated_at: string;
@@ -71,6 +80,12 @@ const inputClass =
 
 function text(value: unknown) {
   return value == null ? "" : String(value);
+}
+
+function photoList(value: unknown): string[] {
+  return Array.isArray(value)
+    ? value.filter((item): item is string => typeof item === "string" && item.length > 0)
+    : [];
 }
 
 function firstText(row: GenericRow | undefined, keys: string[]) {
@@ -133,24 +148,28 @@ function requestNumber() {
     .slice(-7)}`;
 }
 
-function safeFileName(file: File) {
-  return file.name.replace(/[^a-zA-Z0-9._-]/g, "_");
-}
-
 export default function MaintenancePage() {
   const [requests, setRequests] = useState<MaintenanceRequest[]>([]);
   const [residents, setResidents] = useState<GenericRow[]>([]);
   const [rooms, setRooms] = useState<GenericRow[]>([]);
+  const [admissions, setAdmissions] = useState<GenericRow[]>([]);
   const [form, setForm] = useState<MaintenanceForm>(emptyForm);
   const [photoFile, setPhotoFile] = useState<File | null>(null);
+  const [beforeFiles, setBeforeFiles] = useState<File[]>([]);
+  const [duringFiles, setDuringFiles] = useState<File[]>([]);
+  const [afterFiles, setAfterFiles] = useState<File[]>([]);
   const [existingPhoto, setExistingPhoto] = useState<string | null>(null);
   const [editingId, setEditingId] = useState<string | null>(null);
   const [showForm, setShowForm] = useState(false);
   const [search, setSearch] = useState("");
   const [priorityFilter, setPriorityFilter] = useState("All");
   const [statusFilter, setStatusFilter] = useState("All");
+  const [categoryFilter, setCategoryFilter] = useState("All");
+  const [roomFilter, setRoomFilter] = useState("All");
+  const [residentFilter, setResidentFilter] = useState("All");
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
+  const [uploading, setUploading] = useState("");
   const [message, setMessage] = useState("");
   const [error, setError] = useState("");
 
@@ -158,7 +177,7 @@ export default function MaintenancePage() {
     setLoading(true);
     setError("");
 
-    const [requestsResult, residentsResult, roomsResult] = await Promise.all([
+    const [requestsResult, residentsResult, roomsResult, admissionsResult] = await Promise.all([
       supabase
         .from("maintenance_requests")
         .select("*")
@@ -171,6 +190,7 @@ export default function MaintenancePage() {
         .from("rooms")
         .select("*")
         .order("created_at", { ascending: false }),
+      supabase.from("admissions").select("id,resident_id,room_id,status"),
     ]);
 
     const firstError =
@@ -178,21 +198,25 @@ export default function MaintenancePage() {
       residentsResult.error ||
       roomsResult.error;
 
-    if (firstError) {
-      setError(firstError.message);
+    const loadError = firstError || admissionsResult.error;
+
+    if (loadError) {
+      setError(getSupabaseErrorMessage(loadError, "Maintenance requests could not be loaded. Please refresh and try again."));
     } else {
       setRequests(
         (requestsResult.data ?? []) as MaintenanceRequest[]
       );
       setResidents((residentsResult.data ?? []) as GenericRow[]);
       setRooms((roomsResult.data ?? []) as GenericRow[]);
+      setAdmissions((admissionsResult.data ?? []) as GenericRow[]);
     }
 
     setLoading(false);
   }, []);
 
   useEffect(() => {
-    void refresh();
+    const timeout = window.setTimeout(() => void refresh(), 0);
+    return () => window.clearTimeout(timeout);
   }, [refresh]);
 
   const filteredRequests = useMemo(() => {
@@ -229,7 +253,11 @@ export default function MaintenancePage() {
         statusFilter === "All" ||
         request.status === statusFilter;
 
-      return matchesSearch && matchesPriority && matchesStatus;
+      const matchesCategory = categoryFilter === "All" || request.category === categoryFilter;
+      const matchesRoom = roomFilter === "All" || request.room_id === roomFilter;
+      const matchesResident = residentFilter === "All" || request.resident_id === residentFilter;
+
+      return matchesSearch && matchesPriority && matchesStatus && matchesCategory && matchesRoom && matchesResident;
     });
   }, [
     priorityFilter,
@@ -238,6 +266,9 @@ export default function MaintenancePage() {
     rooms,
     search,
     statusFilter,
+    categoryFilter,
+    roomFilter,
+    residentFilter,
   ]);
 
   const summary = useMemo(
@@ -273,6 +304,9 @@ export default function MaintenancePage() {
   function resetForm() {
     setForm(emptyForm);
     setPhotoFile(null);
+    setBeforeFiles([]);
+    setDuringFiles([]);
+    setAfterFiles([]);
     setExistingPhoto(null);
     setEditingId(null);
 
@@ -295,9 +329,9 @@ export default function MaintenancePage() {
     setForm({
       resident_id: request.resident_id ?? "",
       room_id: request.room_id ?? "",
-      title: request.title,
-      category: request.category,
-      description: request.description ?? "",
+      title: request.title ?? "",
+      category: request.category ?? "Other",
+      description: request.description ?? request.complaint_description ?? "",
       priority: request.priority,
       status: request.status,
       assigned_to: request.assigned_to ?? "",
@@ -314,25 +348,28 @@ export default function MaintenancePage() {
     window.scrollTo({ top: 0, behavior: "smooth" });
   }
 
-  async function uploadPhoto(file: File) {
-    const path = `requests/${Date.now()}-${safeFileName(file)}`;
+  async function uploadPhotos(
+    files: File[],
+    requestId: string,
+    kind: "before" | "during" | "after"
+  ) {
+    const urls: string[] = [];
 
-    const { error: uploadError } = await supabase.storage
-      .from("maintenance-photos")
-      .upload(path, file, {
-        cacheControl: "3600",
-        upsert: false,
-      });
+    for (let index = 0; index < files.length; index += 1) {
+      setUploading(`Uploading ${kind} photo ${index + 1} of ${files.length}...`);
+      const path = `requests/${requestId}/${kind}/${Date.now()}-${index}-${safeStorageFileName(files[index])}`;
+      const { error: uploadError } = await supabase.storage
+        .from("maintenance-photos")
+        .upload(path, files[index], { cacheControl: "3600", upsert: false });
 
-    if (uploadError) {
-      throw new Error(uploadError.message);
+      if (uploadError) throw new Error("PHOTO_UPLOAD");
+
+      urls.push(
+        supabase.storage.from("maintenance-photos").getPublicUrl(path).data.publicUrl
+      );
     }
 
-    const { data } = supabase.storage
-      .from("maintenance-photos")
-      .getPublicUrl(path);
-
-    return data.publicUrl;
+    return urls;
   }
 
   async function saveRequest(event: FormEvent<HTMLFormElement>) {
@@ -349,10 +386,23 @@ export default function MaintenancePage() {
     }
 
     try {
-      let photoUrl = existingPhoto;
+      if (Number(form.estimated_cost) < 0 || Number(form.actual_cost) < 0) {
+        throw new Error("COST");
+      }
 
-      if (photoFile) {
-        photoUrl = await uploadPhoto(photoFile);
+      let currentRequest: { resident_id: string | null; room_id: string | null; assigned_date: string | null; completed_at: string | null } | null = null;
+      if (editingId) {
+        const current = await supabase.from("maintenance_requests").select("id,status,resident_id,room_id,assigned_date,completed_at").eq("id", editingId).maybeSingle();
+        if (current.error || !current.data) throw new Error("STALE");
+        currentRequest = current.data as { resident_id: string | null; room_id: string | null; assigned_date: string | null; completed_at: string | null };
+      }
+
+      if (form.resident_id) {
+        const resident = await supabase.from("residents").select("id,status").eq("id", form.resident_id).maybeSingle();
+        if (resident.error || !resident.data || (!editingId && text(resident.data.status).trim().toLowerCase() === "archived")) throw new Error("RESIDENT");
+        const relationshipUnchanged = currentRequest?.resident_id === form.resident_id && currentRequest?.room_id === form.room_id;
+        const validAdmission = admissions.some((admission) => text(admission.resident_id) === form.resident_id && text(admission.room_id) === form.room_id && text(admission.status).trim().toLowerCase() === "active");
+        if (!relationshipUnchanged && !validAdmission) throw new Error("RELATIONSHIP");
       }
 
       const finalCompletionDate =
@@ -372,8 +422,14 @@ export default function MaintenancePage() {
         assigned_to: form.assigned_to.trim() || null,
         estimated_cost: Number(form.estimated_cost) || 0,
         actual_cost: Number(form.actual_cost) || 0,
-        photo_url: photoUrl,
+        photo_url: existingPhoto,
+        assigned_date:
+          currentRequest?.assigned_date ||
+          (form.assigned_to.trim() ? new Date().toISOString().slice(0, 10) : null),
         completion_date: finalCompletionDate,
+        completed_at:
+          currentRequest?.completed_at ||
+          (form.status === "Completed" ? new Date().toISOString() : null),
         notes: form.notes.trim() || null,
         updated_at: new Date().toISOString(),
       };
@@ -383,13 +439,51 @@ export default function MaintenancePage() {
             .from("maintenance_requests")
             .update(payload)
             .eq("id", editingId)
+            .select("*")
+            .single()
         : await supabase.from("maintenance_requests").insert({
             ...payload,
             request_number: requestNumber(),
-          });
+          }).select("*").single();
 
-      if (result.error) {
-        throw new Error(result.error.message);
+      if (result.error || !result.data) {
+        throw new Error("DATABASE");
+      }
+
+      const saved = result.data as MaintenanceRequest;
+      const newBeforeFiles = photoFile ? [photoFile, ...beforeFiles] : beforeFiles;
+      let beforePhotos = photoList(saved.before_photos);
+      let duringPhotos = photoList(saved.during_photos);
+      let afterPhotos = photoList(saved.after_photos);
+
+      try {
+        beforePhotos = [...beforePhotos, ...(await uploadPhotos(newBeforeFiles, saved.id, "before"))];
+        duringPhotos = [...duringPhotos, ...(await uploadPhotos(duringFiles, saved.id, "during"))];
+        afterPhotos = [...afterPhotos, ...(await uploadPhotos(afterFiles, saved.id, "after"))];
+      } catch {
+        setError("The maintenance request was saved, but one or more photos could not be uploaded. Existing photos were preserved.");
+        await refresh();
+        setUploading("");
+        setSaving(false);
+        return;
+      }
+
+      if (newBeforeFiles.length || duringFiles.length || afterFiles.length) {
+        const linked = await supabase.from("maintenance_requests").update({
+          before_photos: beforePhotos,
+          during_photos: duringPhotos,
+          after_photos: afterPhotos,
+          photo_url: existingPhoto || beforePhotos[0] || null,
+          updated_at: new Date().toISOString(),
+        }).eq("id", saved.id);
+
+        if (linked.error) {
+          setError("The maintenance request and photos were saved, but the photo links could not be attached. Existing history was not deleted.");
+          await refresh();
+          setUploading("");
+          setSaving(false);
+          return;
+        }
       }
 
       setMessage(
@@ -402,40 +496,78 @@ export default function MaintenancePage() {
       setShowForm(false);
       await refresh();
     } catch (saveError) {
-      setError(
-        saveError instanceof Error
-          ? saveError.message
-          : "Maintenance request could not be saved."
-      );
+      const code = saveError instanceof Error ? saveError.message : "";
+      const messages: Record<string, string> = {
+        PHOTO_UPLOAD: "The maintenance photo could not be uploaded. The request was not changed.",
+        COST: "Estimated and actual costs cannot be negative.",
+        STALE: "This maintenance request no longer exists. Please refresh and try again.",
+        RESIDENT: "The selected resident is no longer available for a new maintenance request.",
+        RELATIONSHIP: "The selected resident is not currently assigned to the selected room.",
+        DATABASE: "The maintenance request could not be saved. Please review the form and try again.",
+      };
+      setError(messages[code] || "The maintenance request could not be saved. Please try again.");
     }
 
+    setUploading("");
     setSaving(false);
   }
 
-  async function deleteRequest(request: MaintenanceRequest) {
+  async function cancelRequest(request: MaintenanceRequest) {
     if (
       !window.confirm(
-        `Delete maintenance request ${request.request_number}?`
+        `Cancel maintenance request ${request.request_number}? Its history will be preserved.`
       )
     ) {
       return;
     }
 
-    const { error: deleteError } = await supabase
+    const current = await supabase.from("maintenance_requests").select("id,status").eq("id", request.id).maybeSingle();
+    if (current.error || !current.data) {
+      setError("This maintenance request could not be refreshed. Please try again.");
+      return;
+    }
+    if (text(current.data.status).trim().toLowerCase() === "cancelled") {
+      setError("This maintenance request is already cancelled.");
+      return;
+    }
+    const { error: cancelError } = await supabase
       .from("maintenance_requests")
-      .delete()
+      .update({ status: "Cancelled", updated_at: new Date().toISOString() })
       .eq("id", request.id);
 
-    if (deleteError) {
-      setError(deleteError.message);
+    if (cancelError) {
+      setError(getSupabaseErrorMessage(cancelError, "The maintenance request could not be cancelled. Please try again."));
     } else {
-      setMessage("Maintenance request deleted successfully.");
+      setMessage("Maintenance request cancelled. Its history has been preserved.");
       await refresh();
     }
   }
 
   function handlePhoto(event: ChangeEvent<HTMLInputElement>) {
-    setPhotoFile(event.target.files?.[0] ?? null);
+    const file = event.target.files?.[0] ?? null;
+    if (file) {
+      const validationError = validateImageFile(file);
+      if (validationError) { setError(validationError); event.target.value = ""; return; }
+    }
+    setError("");
+    setPhotoFile(file);
+  }
+
+  function handlePhotos(
+    event: ChangeEvent<HTMLInputElement>,
+    kind: "before" | "during" | "after"
+  ) {
+    const files = Array.from(event.target.files ?? []);
+    const validationError = files.map(validateImageFile).find(Boolean);
+    if (validationError) {
+      setError(validationError);
+      event.target.value = "";
+      return;
+    }
+    if (kind === "before") setBeforeFiles(files);
+    else if (kind === "during") setDuringFiles(files);
+    else setAfterFiles(files);
+    setError("");
   }
 
   return (
@@ -516,7 +648,12 @@ export default function MaintenancePage() {
                   >
                     <option value="">No resident selected</option>
 
-                    {residents.map((resident) => (
+                    {residents
+                      .filter((resident) =>
+                        text(resident.id) === form.resident_id ||
+                        text(resident.status).trim().toLowerCase() !== "archived"
+                      )
+                      .map((resident) => (
                       <option
                         key={text(resident.id)}
                         value={text(resident.id)}
@@ -537,7 +674,17 @@ export default function MaintenancePage() {
                   >
                     <option value="">No room selected</option>
 
-                    {rooms.map((room) => (
+                    {rooms
+                      .filter((room) => {
+                        if (!form.resident_id) return true;
+                        if (text(room.id) === form.room_id) return true;
+                        return admissions.some((admission) =>
+                          text(admission.resident_id) === form.resident_id &&
+                          text(admission.room_id) === text(room.id) &&
+                          text(admission.status).trim().toLowerCase() === "active"
+                        );
+                      })
+                      .map((room) => (
                       <option key={text(room.id)} value={text(room.id)}>
                         {roomNumber(room)}
                       </option>
@@ -663,11 +810,11 @@ export default function MaintenancePage() {
                   />
                 </Field>
 
-                <Field label="Issue Photo">
+                <Field label="Primary Before Photo">
                   <input
                     id="maintenance-photo-input"
                     type="file"
-                    accept="image/*"
+                    accept="image/jpeg,image/png,image/webp"
                     onChange={handlePhoto}
                     className={inputClass}
                   />
@@ -683,6 +830,26 @@ export default function MaintenancePage() {
                     </a>
                   )}
                 </Field>
+
+                <Field label="Additional Before Photos">
+                  <input type="file" multiple accept="image/jpeg,image/png,image/webp" onChange={(event) => handlePhotos(event, "before")} className={inputClass} />
+                </Field>
+
+                <Field label="During Work Photos">
+                  <input type="file" multiple accept="image/jpeg,image/png,image/webp" onChange={(event) => handlePhotos(event, "during")} className={inputClass} />
+                </Field>
+
+                <Field label="After Work Photos">
+                  <input type="file" multiple accept="image/jpeg,image/png,image/webp" onChange={(event) => handlePhotos(event, "after")} className={inputClass} />
+                </Field>
+
+                {editingId && (
+                  <div className="md:col-span-2 xl:col-span-3">
+                    <MaintenancePhotoLinks title="Existing before photos" urls={photoList(requests.find((item) => item.id === editingId)?.before_photos)} />
+                    <MaintenancePhotoLinks title="Existing during photos" urls={photoList(requests.find((item) => item.id === editingId)?.during_photos)} />
+                    <MaintenancePhotoLinks title="Existing after photos" urls={photoList(requests.find((item) => item.id === editingId)?.after_photos)} />
+                  </div>
+                )}
 
                 <Field label="Description" wide>
                   <textarea
@@ -724,11 +891,11 @@ export default function MaintenancePage() {
                   disabled={saving}
                   className="rounded-xl bg-indigo-600 px-5 py-3 text-sm font-semibold text-white disabled:opacity-60"
                 >
-                  {saving
+                  {uploading || (saving
                     ? "Saving..."
                     : editingId
                     ? "Update Request"
-                    : "Save Request"}
+                    : "Save Request")}
                 </button>
               </div>
             </form>
@@ -753,7 +920,7 @@ export default function MaintenancePage() {
         </section>
 
         <section className="rounded-3xl border border-slate-200 bg-white shadow-sm">
-          <div className="grid gap-3 border-b border-slate-200 p-5 lg:grid-cols-[1fr_200px_200px_auto]">
+          <div className="grid gap-3 border-b border-slate-200 p-5 md:grid-cols-2 xl:grid-cols-4">
             <input
               value={search}
               onChange={(event) => setSearch(event.target.value)}
@@ -773,6 +940,21 @@ export default function MaintenancePage() {
               <option value="Medium">Medium</option>
               <option value="High">High</option>
               <option value="Emergency">Emergency</option>
+            </select>
+
+            <select value={categoryFilter} onChange={(event) => setCategoryFilter(event.target.value)} className={inputClass}>
+              <option value="All">All Categories</option>
+              {["Electrical", "Plumbing", "Furniture", "Appliance", "Cleaning", "Internet", "Other"].map((category) => <option key={category} value={category}>{category}</option>)}
+            </select>
+
+            <select value={roomFilter} onChange={(event) => setRoomFilter(event.target.value)} className={inputClass}>
+              <option value="All">All Rooms</option>
+              {rooms.map((room) => <option key={text(room.id)} value={text(room.id)}>{roomNumber(room)}</option>)}
+            </select>
+
+            <select value={residentFilter} onChange={(event) => setResidentFilter(event.target.value)} className={inputClass}>
+              <option value="All">All Residents</option>
+              {residents.map((resident) => <option key={text(resident.id)} value={text(resident.id)}>{residentName(resident)}</option>)}
             </select>
 
             <select
@@ -875,7 +1057,7 @@ export default function MaintenancePage() {
 
                         <td className="px-5 py-4">
                           <p className="font-semibold text-slate-900">
-                            {request.title}
+                            {request.title || request.complaint_description || "Maintenance Request"}
                           </p>
                           <p className="mt-1 text-xs text-slate-500">
                             {request.category}
@@ -903,15 +1085,8 @@ export default function MaintenancePage() {
                         </td>
 
                         <td className="px-5 py-4">
-                          {request.photo_url ? (
-                            <a
-                              href={request.photo_url}
-                              target="_blank"
-                              rel="noreferrer"
-                              className="rounded-lg border border-slate-200 px-3 py-2 text-xs font-semibold text-slate-700"
-                            >
-                              Open Photo
-                            </a>
+                          {photoList(request.before_photos).length + photoList(request.during_photos).length + photoList(request.after_photos).length > 0 || request.photo_url ? (
+                            <span className="text-xs font-semibold text-slate-700">{photoList(request.before_photos).length + photoList(request.during_photos).length + photoList(request.after_photos).length || 1} photo(s)</span>
                           ) : (
                             <span className="text-xs text-slate-400">
                               No photo
@@ -931,6 +1106,7 @@ export default function MaintenancePage() {
 
                         <td className="px-5 py-4">
                           <div className="flex flex-wrap gap-2">
+                            <Link href={`/maintenance/${request.id}`} className="rounded-lg border border-slate-300 px-3 py-2 text-xs font-semibold text-slate-700">View</Link>
                             <button
                               type="button"
                               onClick={() => openEditForm(request)}
@@ -942,11 +1118,12 @@ export default function MaintenancePage() {
                             <button
                               type="button"
                               onClick={() =>
-                                void deleteRequest(request)
+                                void cancelRequest(request)
                               }
-                              className="rounded-lg border border-red-200 px-3 py-2 text-xs font-semibold text-red-700"
+                              disabled={request.status === "Cancelled"}
+                              className="rounded-lg border border-slate-300 px-3 py-2 text-xs font-semibold text-slate-700 disabled:opacity-50"
                             >
-                              Delete
+                              Cancel
                             </button>
                           </div>
                         </td>
@@ -1000,4 +1177,9 @@ function StatCard({
       </p>
     </article>
   );
+}
+
+function MaintenancePhotoLinks({ title, urls }: { title: string; urls: string[] }) {
+  if (urls.length === 0) return null;
+  return <div className="mt-3 flex flex-wrap items-center gap-2"><span className="text-xs font-semibold text-slate-500">{title}:</span>{urls.map((url, index) => <a key={`${url}-${index}`} href={url} target="_blank" rel="noreferrer" className="rounded-lg border border-slate-200 px-3 py-2 text-xs font-semibold text-indigo-700">Photo {index + 1}</a>)}</div>;
 }

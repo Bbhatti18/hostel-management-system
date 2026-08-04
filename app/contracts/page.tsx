@@ -1,5 +1,6 @@
 "use client";
 
+import Link from "next/link";
 import {
   FormEvent,
   ReactNode,
@@ -9,13 +10,27 @@ import {
   useState,
 } from "react";
 import { supabase } from "@/lib/supabase";
+import { getSupabaseErrorMessage } from "@/lib/supabaseErrors";
 
-type ContractStatus = "Draft" | "Pending Signature" | "Active" | "Expired" | "Cancelled";
-type SignatureStatus = "Pending" | "Signed";
+type ContractStatus =
+  | "Draft"
+  | "Pending Signature"
+  | "Active"
+  | "Expired"
+  | "Cancelled"
+  | "Terminated";
+type SignatureStatus =
+  | "Pending"
+  | "Submitted"
+  | "Approved"
+  | "Rejected"
+  | "Re-sign Required"
+  | "Signed";
 
 type Resident = {
   id: string;
   full_name: string;
+  status: string | null;
 };
 
 type Admission = {
@@ -57,7 +72,8 @@ type Contract = {
   resident_signature_name: string | null;
   owner_signature_name: string | null;
   signed_at: string | null;
-  status: ContractStatus;
+  status: ContractStatus | null;
+  contract_status: string | null;
   terms: string | null;
   created_at: string;
   updated_at: string;
@@ -114,12 +130,15 @@ function statusClass(status: ContractStatus) {
   if (status === "Pending Signature") return "bg-amber-100 text-amber-700";
   if (status === "Expired") return "bg-red-100 text-red-700";
   if (status === "Cancelled") return "bg-slate-200 text-slate-700";
+  if (status === "Terminated") return "bg-slate-200 text-slate-700";
   return "bg-blue-100 text-blue-700";
 }
 
 function signatureClass(status: SignatureStatus) {
-  return status === "Signed"
+  return status === "Approved"
     ? "bg-emerald-100 text-emerald-700"
+    : status === "Rejected" || status === "Re-sign Required"
+      ? "bg-red-100 text-red-700"
     : "bg-amber-100 text-amber-700";
 }
 
@@ -129,12 +148,6 @@ function money(value: number) {
     currency: "PKR",
     maximumFractionDigits: 0,
   }).format(value || 0);
-}
-
-function makeContractNumber() {
-  return `CNT-${new Date().getFullYear()}-${Date.now()
-    .toString()
-    .slice(-6)}`;
 }
 
 export default function ContractsPage() {
@@ -165,7 +178,7 @@ export default function ContractsPage() {
       { data: bedsData, error: bedsError },
     ] = await Promise.all([
       supabase.from("contracts").select("*").order("created_at", { ascending: false }),
-      supabase.from("residents").select("id, full_name").order("full_name"),
+      supabase.from("residents").select("id, full_name, status").order("full_name"),
       supabase.from("admissions").select("*").order("created_at", { ascending: false }),
       supabase.from("rooms").select("id, room_number").order("room_number"),
       supabase.from("beds").select("id, bed_number").order("bed_number"),
@@ -178,7 +191,14 @@ export default function ContractsPage() {
       roomsError ||
       bedsError;
 
-    if (firstError) setError(firstError.message);
+    if (firstError) {
+      setError(
+        getSupabaseErrorMessage(
+          firstError,
+          "Unable to load contracts. Please try again.",
+        ),
+      );
+    }
 
     setContracts((contractsData ?? []) as Contract[]);
     setResidents((residentsData ?? []) as Resident[]);
@@ -189,6 +209,8 @@ export default function ContractsPage() {
   }, []);
 
   useEffect(() => {
+    // Loading Supabase data is the external synchronization for this effect.
+    // eslint-disable-next-line react-hooks/set-state-in-effect
     void refresh();
   }, [refresh]);
 
@@ -206,7 +228,7 @@ export default function ContractsPage() {
         residentName.toLowerCase().includes(query);
 
       const matchesStatus =
-        statusFilter === "All" || contract.status === statusFilter;
+        statusFilter === "All" || getContractStatus(contract) === statusFilter;
 
       return matchesSearch && matchesStatus;
     });
@@ -215,10 +237,10 @@ export default function ContractsPage() {
   const summary = useMemo(
     () => ({
       total: contracts.length,
-      active: contracts.filter((item) => item.status === "Active").length,
-      pending: contracts.filter((item) => item.status === "Pending Signature")
+      active: contracts.filter((item) => getContractStatus(item) === "Active").length,
+      pending: contracts.filter((item) => getContractStatus(item) === "Pending Signature")
         .length,
-      expired: contracts.filter((item) => item.status === "Expired").length,
+      expired: contracts.filter((item) => getContractStatus(item) === "Expired").length,
     }),
     [contracts]
   );
@@ -228,17 +250,6 @@ export default function ContractsPage() {
     value: ContractForm[K]
   ) {
     setForm((current) => ({ ...current, [key]: value }));
-  }
-
-  function openAddForm() {
-    setEditingId(null);
-    setForm({
-      ...emptyForm,
-      contract_number: makeContractNumber(),
-    });
-    setShowForm(true);
-    setMessage("");
-    setError("");
   }
 
   function openEditForm(contract: Contract) {
@@ -258,7 +269,7 @@ export default function ContractsPage() {
       owner_signature_status: contract.owner_signature_status,
       resident_signature_name: contract.resident_signature_name ?? "",
       owner_signature_name: contract.owner_signature_name ?? "",
-      status: contract.status,
+      status: getContractStatus(contract),
       terms: contract.terms ?? defaultTerms,
     });
     setShowForm(true);
@@ -298,28 +309,105 @@ export default function ContractsPage() {
       return;
     }
 
-    const bothSigned =
-      form.resident_signature_status === "Signed" &&
-      form.owner_signature_status === "Signed";
+    if (form.end_date && new Date(form.end_date) <= new Date(form.start_date)) {
+      setError("End date must be later than the start date.");
+      setSaving(false);
+      return;
+    }
+
+    const [residentResult, admissionResult, duplicateResult] = await Promise.all([
+      supabase
+        .from("residents")
+        .select("id, status")
+        .eq("id", form.resident_id)
+        .maybeSingle(),
+      form.admission_id
+        ? supabase
+            .from("admissions")
+            .select("id, resident_id, room_id, bed_id, status")
+            .eq("id", form.admission_id)
+            .maybeSingle()
+        : Promise.resolve({ data: null, error: null }),
+      form.status === "Active"
+        ? supabase
+            .from("contracts")
+            .select("id")
+            .eq("resident_id", form.resident_id)
+            .or("status.eq.Active,contract_status.eq.Active")
+            .neq("id", editingId ?? "00000000-0000-0000-0000-000000000000")
+            .limit(1)
+            .maybeSingle()
+        : Promise.resolve({ data: null, error: null }),
+    ]);
+
+    const validationError =
+      residentResult.error || admissionResult.error || duplicateResult.error;
+
+    if (validationError) {
+      setError(
+        getSupabaseErrorMessage(
+          validationError,
+          "Unable to verify the contract details. Please try again.",
+        ),
+      );
+      setSaving(false);
+      return;
+    }
+
+    if (!residentResult.data || residentResult.data.status === "Archived") {
+      setError("The selected resident is no longer available for a contract.");
+      await refresh();
+      setSaving(false);
+      return;
+    }
+
+    if (
+      form.admission_id &&
+      (!admissionResult.data ||
+        admissionResult.data.resident_id !== form.resident_id ||
+        !["Active", "Pending"].includes(admissionResult.data.status))
+    ) {
+      setError("The selected admission is no longer current for this resident.");
+      await refresh();
+      setSaving(false);
+      return;
+    }
+
+    if (duplicateResult.data) {
+      setError("This resident already has an active contract.");
+      setSaving(false);
+      return;
+    }
+
+    const existingContract = editingId
+      ? contracts.find((contract) => contract.id === editingId)
+      : null;
+
+    if (!existingContract) {
+      setError("Use Prepare Contract to create a contract from a Pending admission.");
+      setSaving(false);
+      return;
+    }
 
     const payload = {
-      contract_number: form.contract_number.trim(),
-      resident_id: form.resident_id,
-      admission_id: form.admission_id || null,
-      room_id: form.room_id || null,
-      bed_id: form.bed_id || null,
-      start_date: form.start_date,
+      contract_number: existingContract.contract_number,
+      resident_id: existingContract.resident_id,
+      admission_id: existingContract.admission_id,
+      room_id: existingContract.room_id,
+      bed_id: existingContract.bed_id,
+      start_date: existingContract.start_date,
       end_date: form.end_date || null,
-      monthly_rent: Number(form.monthly_rent) || 0,
-      security_deposit: Number(form.security_deposit) || 0,
-      notice_period_days: Number(form.notice_period_days) || 30,
-      resident_signature_status: form.resident_signature_status,
-      owner_signature_status: form.owner_signature_status,
-      resident_signature_name: form.resident_signature_name.trim() || null,
-      owner_signature_name: form.owner_signature_name.trim() || null,
-      signed_at: bothSigned ? new Date().toISOString() : null,
-      status: form.status,
-      terms: form.terms.trim() || null,
+      monthly_rent: existingContract.monthly_rent,
+      security_deposit: existingContract.security_deposit,
+      notice_period_days: existingContract.notice_period_days,
+      resident_signature_status: existingContract.resident_signature_status,
+      owner_signature_status: existingContract.owner_signature_status,
+      resident_signature_name: existingContract.resident_signature_name,
+      owner_signature_name: existingContract.owner_signature_name,
+      signed_at: existingContract.signed_at,
+      status: getContractStatus(existingContract),
+      contract_status: getContractStatus(existingContract),
+      terms: existingContract.terms,
       updated_at: new Date().toISOString(),
     };
 
@@ -328,7 +416,13 @@ export default function ContractsPage() {
       : await supabase.from("contracts").insert(payload);
 
     if (result.error) {
-      setError(result.error.message);
+      setError(
+        getSupabaseErrorMessage(
+          result.error,
+          "Unable to save this contract. Please try again.",
+          "A contract with the same contract number already exists.",
+        ),
+      );
     } else {
       setMessage(
         editingId
@@ -344,18 +438,31 @@ export default function ContractsPage() {
     setSaving(false);
   }
 
-  async function deleteContract(contract: Contract) {
-    if (!window.confirm(`Delete contract ${contract.contract_number}?`)) return;
+  async function cancelContract(contract: Contract) {
+    if (getContractStatus(contract) === "Cancelled") return;
+    if (!window.confirm(`Cancel contract ${contract.contract_number}?`)) return;
 
-    const { error: deleteError } = await supabase
+    setMessage("");
+    setError("");
+
+    const { error: cancelError } = await supabase
       .from("contracts")
-      .delete()
+      .update({
+        status: "Cancelled",
+        contract_status: "Cancelled",
+        updated_at: new Date().toISOString(),
+      })
       .eq("id", contract.id);
 
-    if (deleteError) {
-      setError(deleteError.message);
+    if (cancelError) {
+      setError(
+        getSupabaseErrorMessage(
+          cancelError,
+          "Unable to cancel this contract. Please try again.",
+        ),
+      );
     } else {
-      setMessage("Contract deleted successfully.");
+      setMessage("Contract cancelled successfully.");
       await refresh();
     }
   }
@@ -387,7 +494,7 @@ export default function ContractsPage() {
           </style>
         </head>
         <body>
-          <h1>Hostel Management System</h1>
+          <h1>StayHub</h1>
           <div class="meta">Resident Contract</div>
           <div class="grid">
             <div class="card"><div class="label">Contract Number</div><div class="value">${contract.contract_number}</div></div>
@@ -416,7 +523,7 @@ export default function ContractsPage() {
         <section className="flex flex-col gap-4 rounded-3xl border border-slate-200 bg-white p-6 shadow-sm sm:flex-row sm:items-center sm:justify-between">
           <div>
             <p className="text-sm font-semibold uppercase tracking-[0.2em] text-indigo-600">
-              Hostel Management System
+              StayHub
             </p>
             <h1 className="mt-2 text-3xl font-bold text-slate-900">
               Contracts
@@ -426,13 +533,12 @@ export default function ContractsPage() {
             </p>
           </div>
 
-          <button
-            type="button"
-            onClick={openAddForm}
+          <Link
+            href="/contracts/add"
             className="rounded-xl bg-indigo-600 px-5 py-3 text-sm font-semibold text-white hover:bg-indigo-700"
           >
             + Add Contract
-          </button>
+          </Link>
         </section>
 
         {(message || error) && (
@@ -455,7 +561,7 @@ export default function ContractsPage() {
                   {editingId ? "Edit Contract" : "Add Contract"}
                 </h2>
                 <p className="mt-1 text-sm text-slate-500">
-                  Select an admission to fill resident, room, bed, rent and deposit automatically.
+                  Contract identity, admission terms, resident signature, and activation status are locked. Only the optional end date can be adjusted here.
                 </p>
               </div>
 
@@ -473,6 +579,7 @@ export default function ContractsPage() {
                 <Field label="Contract Number *">
                   <input
                     required
+                    disabled
                     value={form.contract_number}
                     onChange={(event) =>
                       updateField("contract_number", event.target.value)
@@ -483,29 +590,42 @@ export default function ContractsPage() {
 
                 <Field label="Admission">
                   <select
+                    disabled
                     value={form.admission_id}
                     onChange={(event) => applyAdmission(event.target.value)}
                     className={inputClass}
                   >
                     <option value="">Select admission</option>
-                    {admissions.map((admission) => {
+                    {admissions
+                      .filter(
+                        (admission) =>
+                          (["Active", "Pending"].includes(admission.status) &&
+                            residents.find(
+                              (resident) =>
+                                resident.id === admission.resident_id,
+                            )?.status !== "Archived") ||
+                          (Boolean(editingId) &&
+                            admission.id === form.admission_id),
+                      )
+                      .map((admission) => {
                       const resident = residents.find(
                         (item) => item.id === admission.resident_id
                       );
 
                       return (
                         <option key={admission.id} value={admission.id}>
-                          {resident?.full_name ?? "Unknown"} â{" "}
+                          {resident?.full_name ?? "Unknown"} —{" "}
                           {admission.admission_date}
                         </option>
                       );
-                    })}
+                      })}
                   </select>
                 </Field>
 
                 <Field label="Resident *">
                   <select
                     required
+                    disabled
                     value={form.resident_id}
                     onChange={(event) =>
                       updateField("resident_id", event.target.value)
@@ -513,16 +633,29 @@ export default function ContractsPage() {
                     className={inputClass}
                   >
                     <option value="">Select resident</option>
-                    {residents.map((resident) => (
-                      <option key={resident.id} value={resident.id}>
-                        {resident.full_name}
-                      </option>
-                    ))}
+                    {residents
+                      .filter(
+                        (resident) =>
+                          resident.status !== "Archived" ||
+                          (Boolean(editingId) &&
+                            resident.id === form.resident_id),
+                      )
+                      .map((resident) => (
+                        <option
+                          key={resident.id}
+                          value={resident.id}
+                          disabled={resident.status === "Archived"}
+                        >
+                          {resident.full_name}
+                          {resident.status === "Archived" ? " (Archived)" : ""}
+                        </option>
+                      ))}
                   </select>
                 </Field>
 
                 <Field label="Room">
                   <select
+                    disabled
                     value={form.room_id}
                     onChange={(event) =>
                       updateField("room_id", event.target.value)
@@ -540,6 +673,7 @@ export default function ContractsPage() {
 
                 <Field label="Bed">
                   <select
+                    disabled
                     value={form.bed_id}
                     onChange={(event) =>
                       updateField("bed_id", event.target.value)
@@ -558,6 +692,7 @@ export default function ContractsPage() {
                 <Field label="Start Date *">
                   <input
                     required
+                    disabled
                     type="date"
                     value={form.start_date}
                     onChange={(event) =>
@@ -582,6 +717,7 @@ export default function ContractsPage() {
                   <input
                     type="number"
                     min="0"
+                    disabled
                     value={form.monthly_rent}
                     onChange={(event) =>
                       updateField("monthly_rent", event.target.value)
@@ -594,6 +730,7 @@ export default function ContractsPage() {
                   <input
                     type="number"
                     min="0"
+                    disabled
                     value={form.security_deposit}
                     onChange={(event) =>
                       updateField("security_deposit", event.target.value)
@@ -606,6 +743,7 @@ export default function ContractsPage() {
                   <input
                     type="number"
                     min="0"
+                    disabled
                     value={form.notice_period_days}
                     onChange={(event) =>
                       updateField("notice_period_days", event.target.value)
@@ -616,6 +754,7 @@ export default function ContractsPage() {
 
                 <Field label="Resident Signature">
                   <select
+                    disabled
                     value={form.resident_signature_status}
                     onChange={(event) =>
                       updateField(
@@ -632,6 +771,7 @@ export default function ContractsPage() {
 
                 <Field label="Resident Signature Name">
                   <input
+                    disabled
                     value={form.resident_signature_name}
                     onChange={(event) =>
                       updateField(
@@ -646,6 +786,7 @@ export default function ContractsPage() {
 
                 <Field label="Owner Signature">
                   <select
+                    disabled
                     value={form.owner_signature_status}
                     onChange={(event) =>
                       updateField(
@@ -662,6 +803,7 @@ export default function ContractsPage() {
 
                 <Field label="Owner Signature Name">
                   <input
+                    disabled
                     value={form.owner_signature_name}
                     onChange={(event) =>
                       updateField(
@@ -676,6 +818,7 @@ export default function ContractsPage() {
 
                 <Field label="Contract Status">
                   <select
+                    disabled
                     value={form.status}
                     onChange={(event) =>
                       updateField(
@@ -692,11 +835,13 @@ export default function ContractsPage() {
                     <option value="Active">Active</option>
                     <option value="Expired">Expired</option>
                     <option value="Cancelled">Cancelled</option>
+                    <option value="Terminated">Terminated (Legacy)</option>
                   </select>
                 </Field>
 
                 <Field label="Terms and Conditions" wide>
                   <textarea
+                    disabled
                     value={form.terms}
                     onChange={(event) =>
                       updateField("terms", event.target.value)
@@ -761,6 +906,7 @@ export default function ContractsPage() {
               <option value="Active">Active</option>
               <option value="Expired">Expired</option>
               <option value="Cancelled">Cancelled</option>
+              <option value="Terminated">Terminated (Legacy)</option>
             </select>
 
             <button
@@ -883,15 +1029,22 @@ export default function ContractsPage() {
                         <td className="px-5 py-4">
                           <span
                             className={`inline-flex rounded-full px-3 py-1 text-xs font-bold ${statusClass(
-                              contract.status
+                              getContractStatus(contract)
                             )}`}
                           >
-                            {contract.status}
+                            {getContractStatus(contract)}
                           </span>
                         </td>
 
                         <td className="px-5 py-4">
                           <div className="flex flex-wrap gap-2">
+                            <Link
+                              href={`/contracts/${contract.id}`}
+                              className="rounded-lg border border-slate-200 px-3 py-2 text-xs font-semibold text-slate-700"
+                            >
+                              View
+                            </Link>
+
                             <button
                               type="button"
                               onClick={() => printContract(contract)}
@@ -908,13 +1061,17 @@ export default function ContractsPage() {
                               Edit
                             </button>
 
-                            <button
-                              type="button"
-                              onClick={() => void deleteContract(contract)}
-                              className="rounded-lg border border-red-200 px-3 py-2 text-xs font-semibold text-red-700"
-                            >
-                              Delete
-                            </button>
+                            {!["Cancelled", "Terminated"].includes(
+                              getContractStatus(contract),
+                            ) && (
+                              <button
+                                type="button"
+                                onClick={() => void cancelContract(contract)}
+                                className="rounded-lg border border-amber-200 px-3 py-2 text-xs font-semibold text-amber-700"
+                              >
+                                Cancel
+                              </button>
+                            )}
                           </div>
                         </td>
                       </tr>
@@ -962,4 +1119,8 @@ function StatCard({
       <p className="mt-2 text-2xl font-bold text-slate-900">{value}</p>
     </article>
   );
+}
+
+function getContractStatus(contract: Contract) {
+  return (contract.status ?? contract.contract_status ?? "Draft") as ContractStatus;
 }

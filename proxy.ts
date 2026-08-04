@@ -1,8 +1,10 @@
 import { NextResponse, type NextRequest } from "next/server";
-import { createClient } from "@supabase/supabase-js";
+import { createClient, type SupabaseClient } from "@supabase/supabase-js";
 
 const supabaseUrl = process.env.NEXT_PUBLIC_SUPABASE_URL ?? "http://127.0.0.1:54321";
 const supabaseAnonKey = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY ?? "dummy-key";
+const COOKIE_CHUNK_SIZE = 3000;
+const MAX_COOKIE_CHUNKS = 12;
 
 const adminRoutes = [
   "/dashboard",
@@ -38,18 +40,28 @@ function isResidentPortalRoute(pathname: string) {
 function createCookieStorage(request: NextRequest, response: NextResponse) {
   return {
     getItem(key: string) {
-      return request.cookies.get(key)?.value ?? null;
+      const legacyValue = request.cookies.get(key)?.value;
+      if (legacyValue) return decodeURIComponent(legacyValue);
+
+      let combined = "";
+      for (let index = 0; index < MAX_COOKIE_CHUNKS; index += 1) {
+        const chunk = request.cookies.get(`${key}.${index}`)?.value;
+        if (!chunk) break;
+        combined += chunk;
+      }
+
+      return combined ? decodeURIComponent(combined) : null;
     },
     setItem(key: string, value: string) {
-      response.cookies.set(key, value, {
-        httpOnly: true,
-        sameSite: "lax",
-        path: "/",
-        secure: process.env.NODE_ENV === "production",
-      });
+      response.cookies.delete(key);
+      for (let index = 0; index < MAX_COOKIE_CHUNKS; index += 1) response.cookies.delete(`${key}.${index}`);
+      const encoded = encodeURIComponent(value);
+      const chunks = encoded.match(new RegExp(`.{1,${COOKIE_CHUNK_SIZE}}`, "g")) ?? [];
+      chunks.forEach((chunk, index) => response.cookies.set(`${key}.${index}`, chunk, { httpOnly: false, sameSite: "lax", path: "/", secure: process.env.NODE_ENV === "production", maxAge: 31536000 }));
     },
     removeItem(key: string) {
       response.cookies.delete(key);
+      for (let index = 0; index < MAX_COOKIE_CHUNKS; index += 1) response.cookies.delete(`${key}.${index}`);
     },
   };
 }
@@ -66,7 +78,7 @@ function createServerClient(request: NextRequest, response: NextResponse) {
   });
 }
 
-async function getUserRole(supabase: any, email: string | undefined) {
+async function getUserRole(supabase: SupabaseClient, email: string | undefined) {
   if (!email) {
     return null;
   }
@@ -85,14 +97,16 @@ async function getUserRole(supabase: any, email: string | undefined) {
 
   const { data: residentUser } = await supabase
     .from("residents")
-    .select("email")
+    .select("email, status")
     .ilike("email", normalizedEmail)
     .maybeSingle();
 
-  return residentUser?.email ? ("resident" as const) : null;
+  return residentUser?.email && String(residentUser.status ?? "").trim().toLowerCase() !== "archived"
+    ? ("resident" as const)
+    : null;
 }
 
-export async function middleware(request: NextRequest) {
+export async function proxy(request: NextRequest) {
   const { pathname } = request.nextUrl;
   const response = NextResponse.next();
 
@@ -102,14 +116,14 @@ export async function middleware(request: NextRequest) {
 
   const supabase = createServerClient(request, response);
   const {
-    data: { session },
-  } = await supabase.auth.getSession();
+    data: { user },
+  } = await supabase.auth.getUser();
 
-  if (!session?.user?.email) {
+  if (!user?.email) {
     return NextResponse.redirect(new URL(loginPath, request.url));
   }
 
-  const role = await getUserRole(supabase, session.user.email);
+  const role = await getUserRole(supabase, user.email);
 
   if (isAdminRoute(pathname)) {
     if (role === "staff") {

@@ -108,7 +108,7 @@ export default function AuditPage() {
           <div className="rounded-2xl border bg-white p-6 shadow-sm">
 
             <p className="text-sm text-slate-500">
-              Today's Logs
+              Today&apos;s Logs
             </p>
 
             <h2 className="mt-2 text-3xl font-bold text-blue-600">

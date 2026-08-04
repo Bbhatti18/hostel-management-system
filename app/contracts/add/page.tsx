@@ -1,521 +1,282 @@
 "use client";
 
 import Link from "next/link";
-import { useEffect, useState } from "react";
+import { FormEvent, useEffect, useMemo, useState } from "react";
 import { useRouter } from "next/navigation";
+import { uploadContractAgreement } from "@/lib/contractStorage";
+import { normalizeBedLabel } from "@/lib/bedLabels";
 import { supabase } from "@/lib/supabase";
-import SignatureCanvas from "react-signature-canvas";
-import { useRef } from "react";
+import { getSupabaseErrorMessage } from "@/lib/supabaseErrors";
 
-type Resident = {
-  id: number;
-  full_name: string;
+type Resident = { id: string; full_name: string; status: string | null };
+type Admission = {
+  id: string;
+  resident_id: string;
+  room_id: string | null;
+  bed_id: string | null;
+  admission_date: string;
+  expected_leaving_date: string | null;
+  monthly_rent: number;
+  security_deposit: number;
+  notice_period_days: number;
+  status: string;
 };
-type ContractTemplate = {
-  id: number;
-  title: string;
-  content: string;
-};
+type ContractTemplate = { id: number; title: string; content: string };
+type Room = { id: string; room_number: string };
+type Bed = { id: string; bed_number: string };
+
+function makeContractNumber() {
+  return `CNT-${new Date().getFullYear()}-${Date.now().toString().slice(-8)}`;
+}
+
+function money(value: number) {
+  return new Intl.NumberFormat("en-PK", {
+    style: "currency",
+    currency: "PKR",
+    maximumFractionDigits: 0,
+  }).format(value || 0);
+}
+
 export default function AddContractPage() {
   const router = useRouter();
-const signatureRef = useRef<SignatureCanvas | null>(null);
   const [residents, setResidents] = useState<Resident[]>([]);
-  const [residentId, setResidentId] = useState("");
-  const [startDate, setStartDate] = useState("");
+  const [admissions, setAdmissions] = useState<Admission[]>([]);
+  const [rooms, setRooms] = useState<Room[]>([]);
+  const [beds, setBeds] = useState<Bed[]>([]);
+  const [activeTemplate, setActiveTemplate] = useState<ContractTemplate | null>(null);
+  const [templateMessage, setTemplateMessage] = useState("");
+  const [admissionId, setAdmissionId] = useState("");
   const [endDate, setEndDate] = useState("");
-  const [monthlyRent, setMonthlyRent] = useState("");
-  const [securityDeposit, setSecurityDeposit] = useState("");
-  const [contractStatus, setContractStatus] =
-    useState("Active");
   const [notes, setNotes] = useState("");
-  const [acceptedTerms, setAcceptedTerms] = useState(false);
-  const [activeTemplate, setActiveTemplate] =
-  useState<ContractTemplate | null>(null);
-  const [agreementFile, setAgreementFile] =
-    useState<File | null>(null);
-
-  const [loadingResidents, setLoadingResidents] =
-    useState(true);
+  const [agreementFile, setAgreementFile] = useState<File | null>(null);
+  const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
   const [message, setMessage] = useState("");
 
   useEffect(() => {
-    fetchResidents();
-    fetchActiveTemplate();
+    let active = true;
+    async function loadPageData() {
+      const [residentResult, admissionResult, contractResult, templateResult, roomResult, bedResult] = await Promise.all([
+        supabase.from("residents").select("id, full_name, status").order("full_name"),
+        supabase
+          .from("admissions")
+          .select("id, resident_id, room_id, bed_id, admission_date, expected_leaving_date, monthly_rent, security_deposit, notice_period_days, status")
+          .eq("status", "Pending")
+          .order("created_at", { ascending: false }),
+        supabase.from("contracts").select("id, admission_id, status, contract_status"),
+        supabase.from("contract_templates").select("id, title, content").eq("is_active", true).order("id", { ascending: false }),
+        supabase.from("rooms").select("id, room_number"),
+        supabase.from("beds").select("id, bed_number"),
+      ]);
+
+      if (!active) return;
+      const firstError = residentResult.error || admissionResult.error || contractResult.error || templateResult.error || roomResult.error || bedResult.error;
+      if (firstError) {
+        setMessage(getSupabaseErrorMessage(firstError, "Unable to load contract form data. Please try again."));
+      }
+
+      const existingAdmissionIds = new Set(
+        (contractResult.data ?? [])
+          .filter((item) => (item.status || item.contract_status) !== "Cancelled")
+          .map((item) => item.admission_id)
+          .filter(Boolean),
+      );
+      const residentRows = (residentResult.data ?? []) as Resident[];
+      setResidents(residentRows);
+      setAdmissions(
+        ((admissionResult.data ?? []) as Admission[]).filter(
+          (admission) =>
+            !existingAdmissionIds.has(admission.id) &&
+            residentRows.find((resident) => resident.id === admission.resident_id)?.status !== "Archived",
+        ),
+      );
+      setRooms((roomResult.data ?? []) as Room[]);
+      setBeds((bedResult.data ?? []) as Bed[]);
+      const activeTemplates = (templateResult.data ?? []) as ContractTemplate[];
+      if (templateResult.error) {
+        setActiveTemplate(null);
+        setTemplateMessage("The active contract template could not be verified. Please try again.");
+      } else if (activeTemplates.length === 1 && activeTemplates[0].content.trim()) {
+        setActiveTemplate(activeTemplates[0]);
+        setTemplateMessage("");
+      } else {
+        setActiveTemplate(null);
+        setTemplateMessage(
+          activeTemplates.length === 0
+            ? "No active contract template is available. Please activate the standard contract template first."
+            : activeTemplates.length > 1
+              ? "Multiple active contract templates are available. Keep one standard template active or select the required template from Contracts."
+              : "The active contract template has no terms. Complete the standard template before preparing this contract.",
+        );
+      }
+      setLoading(false);
+    }
+    void loadPageData();
+    return () => { active = false; };
   }, []);
 
-  async function fetchResidents() {
-    setLoadingResidents(true);
-    setMessage("");
-
-    const { data, error } = await supabase
-      .from("residents")
-      .select("id, full_name")
-      .order("full_name", { ascending: true });
-
-    if (error) {
-      console.error("Resident loading error:", error);
-      setMessage("Failed to load residents.");
-      setResidents([]);
-      setLoadingResidents(false);
-      return;
-    }
-
-    setResidents((data || []) as Resident[]);
-    setLoadingResidents(false);
-  }
-async function fetchActiveTemplate() {
-  const { data, error } = await supabase
-    .from("contract_templates")
-    .select("id, title, content")
-    .eq("is_active", true)
-    .order("id", { ascending: false })
-    .limit(1)
-    .maybeSingle();
-
-  if (error) {
-    console.error("Template loading error:", error);
-    setActiveTemplate(null);
-    return;
-  }
-
-  console.log("Active template:", data);
-  setActiveTemplate(data);
-}
-  async function uploadAgreement(
-    file: File,
-    contractId: number
-  ) {
-    const safeFileName = file.name
-      .replace(/\s+/g, "-")
-      .replace(/[^a-zA-Z0-9._-]/g, "");
-
-    const filePath = `${contractId}/${Date.now()}-${safeFileName}`;
-
-    const { error: uploadError } = await supabase.storage
-      .from("contract-agreements")
-      .upload(filePath, file);
-
-    if (uploadError) {
-      throw uploadError;
-    }
-
-    const { data: urlData } = supabase.storage
-      .from("contract-agreements")
-      .getPublicUrl(filePath);
-
-    return urlData.publicUrl;
-  }
-async function uploadSignature(contractId: number) {
-  if (!signatureRef.current) {
-    return null;
-  }
-
-  if (signatureRef.current.isEmpty()) {
-    return null;
-  }
-
-  const canvas = signatureRef.current.getCanvas();
-
-  const signatureBlob = await new Promise<Blob>(
-    (resolve, reject) => {
-      canvas.toBlob(
-        (blob) => {
-          if (blob) {
-            resolve(blob);
-          } else {
-            reject(
-              new Error(
-                "Failed to create signature image."
-              )
-            );
-          }
-        },
-        "image/png"
-      );
-    }
+  const admission = useMemo(
+    () => admissions.find((item) => item.id === admissionId) ?? null,
+    [admissionId, admissions],
   );
+  const resident = residents.find((item) => item.id === admission?.resident_id);
+  const room = rooms.find((item) => item.id === admission?.room_id);
+  const bed = beds.find((item) => item.id === admission?.bed_id);
 
-  const filePath =
-    `${contractId}/` +
-    `${Date.now()}-resident-signature.png`;
-
-  const { error: uploadError } =
-    await supabase.storage
-      .from("contract-signature")
-      .upload(filePath, signatureBlob, {
-        contentType: "image/png",
-        upsert: false,
-      });
-
-  if (uploadError) {
-    throw uploadError;
+  function selectAdmission(value: string) {
+    setAdmissionId(value);
+    setEndDate(admissions.find((item) => item.id === value)?.expected_leaving_date ?? "");
   }
 
-  const { data: publicUrlData } =
-    supabase.storage
-      .from("contract-signature")
-      .getPublicUrl(filePath);
-
-  return publicUrlData.publicUrl;
-}
-  async function handleSubmit(
-    event: React.FormEvent<HTMLFormElement>
-  ) {
+  async function handleSubmit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
-    setMessage("");
-if (!acceptedTerms) {
-  setMessage("Please accept the Terms & Conditions.");
-  return;
-}
-    if (
-      !residentId ||
-      !startDate ||
-      !endDate ||
-      !monthlyRent
-    ) {
-      setMessage("Please complete all required fields.");
-      return;
-    }
-
-    if (new Date(endDate) <= new Date(startDate)) {
-      setMessage(
-        "End date must be later than start date."
-      );
-      return;
-    }
-
-    if (Number(monthlyRent) <= 0) {
-      setMessage(
-        "Monthly rent must be greater than zero."
-      );
-      return;
-    }
-
-    if (
-      securityDeposit &&
-      Number(securityDeposit) < 0
-    ) {
-      setMessage(
-        "Security deposit cannot be negative."
-      );
-      return;
-    }
-
-    if (
-      agreementFile &&
-      agreementFile.type !== "application/pdf"
-    ) {
-      setMessage("Only PDF files are allowed.");
-      return;
-    }
-
     setSaving(true);
+    setMessage("");
 
-    const { data: contractData, error: contractError } =
-      await supabase
-        .from("contracts")
-        .insert({
-          resident_id: Number(residentId),
-          start_date: startDate,
-          end_date: endDate,
-          monthly_rent: Number(monthlyRent),
-          security_deposit: securityDeposit
-            ? Number(securityDeposit)
-            : 0,
-          contract_status: contractStatus,
-          agreement_file: null,
-          notes: notes.trim() || null,
-        })
-        .select("id")
-        .single();
-
-    if (contractError || !contractData) {
-      console.error("Contract saving error:", contractError);
-      setMessage("Failed to save contract.");
+    if (!admission || !resident) {
+      setMessage("Select a Pending admission before creating the contract.");
       setSaving(false);
       return;
     }
-const signatureUrl = await uploadSignature(contractData.id);
+    if (!activeTemplate?.content.trim()) {
+      setMessage(templateMessage || "No active contract template is available. Please activate the standard contract template first.");
+      setSaving(false);
+      return;
+    }
+    if (endDate && new Date(endDate) <= new Date(admission.admission_date)) {
+      setMessage("End date must be later than the admission date.");
+      setSaving(false);
+      return;
+    }
 
-if (signatureUrl) {
-  const { error: signatureUpdateError } = await supabase
-    .from("contracts")
-    .update({
-      resident_signature: signatureUrl,
-    })
-    .eq("id", contractData.id);
+    const [residentResult, admissionResult, duplicateResult] = await Promise.all([
+      supabase.from("residents").select("id, status").eq("id", admission.resident_id).maybeSingle(),
+      supabase
+        .from("admissions")
+        .select("id, resident_id, room_id, bed_id, admission_date, monthly_rent, security_deposit, notice_period_days, status")
+        .eq("id", admission.id)
+        .maybeSingle(),
+      supabase.from("contracts").select("id, status, contract_status").eq("admission_id", admission.id),
+    ]);
+    const validationError = residentResult.error || admissionResult.error || duplicateResult.error;
+    if (validationError) {
+      setMessage(getSupabaseErrorMessage(validationError, "Unable to verify the admission before creating the contract."));
+      setSaving(false);
+      return;
+    }
+    const currentAdmission = admissionResult.data;
+    if (!residentResult.data || residentResult.data.status === "Archived") {
+      setMessage("The admission resident is no longer eligible for a contract.");
+      setSaving(false);
+      return;
+    }
+    if (!currentAdmission || currentAdmission.status !== "Pending" || currentAdmission.resident_id !== admission.resident_id) {
+      setMessage("The selected admission is no longer Pending. Refresh and try again.");
+      setSaving(false);
+      return;
+    }
+    if ((duplicateResult.data ?? []).some((item) => (item.status || item.contract_status) !== "Cancelled")) {
+      setMessage("A contract already exists for this admission.");
+      setSaving(false);
+      return;
+    }
 
-  if (signatureUpdateError) {
-    console.error(
-      "Signature saving error:",
-      signatureUpdateError
-    );
+    const now = new Date().toISOString();
+    const specialClauses = notes.trim();
+    const termsSnapshot = `${activeTemplate.content.trim()}${
+      specialClauses ? `\n\nSpecial Clauses:\n${specialClauses}` : ""
+    }`;
+    const { data: contractData, error: contractError } = await supabase
+      .from("contracts")
+      .insert({
+        contract_number: makeContractNumber(),
+        resident_id: currentAdmission.resident_id,
+        admission_id: currentAdmission.id,
+        room_id: currentAdmission.room_id,
+        bed_id: currentAdmission.bed_id,
+        template_id: activeTemplate.id,
+        contract_content: termsSnapshot,
+        terms: termsSnapshot,
+        start_date: currentAdmission.admission_date,
+        end_date: endDate || null,
+        monthly_rent: Number(currentAdmission.monthly_rent) || 0,
+        security_deposit: Number(currentAdmission.security_deposit) || 0,
+        notice_period_days: Number(currentAdmission.notice_period_days) || 30,
+        status: "Pending Signature",
+        contract_status: "Pending Signature",
+        resident_signature_status: "Pending",
+        owner_signature_status: "Pending",
+        signed_by_resident: false,
+        signed_at: null,
+        notes: notes.trim() || null,
+        created_at: now,
+        updated_at: now,
+      })
+      .select("id")
+      .single();
 
-    setMessage(
-      "Contract saved, but signature could not be saved."
-    );
+    if (contractError || !contractData) {
+      setMessage(getSupabaseErrorMessage(contractError, "Unable to save the contract. Please try again.", "A contract with the same number or admission already exists."));
+      setSaving(false);
+      return;
+    }
 
-    setSaving(false);
-    return;
-  }
-}
     if (agreementFile) {
       try {
-        const agreementUrl = await uploadAgreement(
-          agreementFile,
-          contractData.id
-        );
-
-        const { error: updateError } = await supabase
-          .from("contracts")
-          .update({
-            agreement_file: agreementUrl,
-          })
-          .eq("id", contractData.id);
-
-        if (updateError) {
-          throw updateError;
-        }
-      } catch (fileError) {
-        console.error("Agreement upload error:", fileError);
-        setMessage(
-          "Contract saved, but agreement file could not be uploaded."
-        );
+        await uploadContractAgreement(String(contractData.id), agreementFile);
+      } catch (agreementError) {
+        setMessage(agreementError instanceof Error ? `Contract created, but ${agreementError.message.toLowerCase()}` : "Contract created, but the agreement PDF could not be uploaded.");
         setSaving(false);
         return;
       }
     }
 
-    setSaving(false);
-    router.push("/contracts");
+    router.push(`/contracts/${contractData.id}`);
     router.refresh();
   }
 
- return (
-    <div className="min-h-screen bg-gray-50 p-6">
+  return (
+    <main className="min-h-screen bg-gray-50 p-6">
       <div className="mx-auto max-w-4xl rounded-xl bg-white p-6 shadow">
-        <div className="mb-6">
-          <h1 className="text-2xl font-bold text-gray-800">
-            Add Contract
-          </h1>
+        <p className="text-sm font-semibold uppercase tracking-[0.2em] text-indigo-600">StayHub</p>
+        <h1 className="mt-2 text-2xl font-bold text-gray-800">Prepare Contract</h1>
+        <p className="mt-1 text-sm text-gray-500">Admission details are authoritative. The resident signs later in their portal.</p>
 
-          <p className="mt-1 text-sm text-gray-500">
-            Create a new resident contract.
-          </p>
-        </div>
+        {message && <div className="mt-5 rounded-lg bg-red-50 p-3 text-sm text-red-700">{message}</div>}
+        {!loading && !activeTemplate && <div className="mt-5 rounded-lg border border-amber-200 bg-amber-50 p-4 text-sm text-amber-800">{templateMessage}</div>}
 
-        {message && (
-          <div className="mb-5 rounded-lg bg-red-50 p-3 text-sm text-red-700">
-            {message}
-          </div>
-        )}
+        <form onSubmit={handleSubmit} className="mt-6 space-y-6">
+          <label className="block">
+            <span className="mb-2 block text-sm font-medium">Pending Admission *</span>
+            <select value={admissionId} onChange={(event) => selectAdmission(event.target.value)} required disabled={loading || saving} className="w-full rounded-lg border px-3 py-2">
+              <option value="">{loading ? "Loading admissions..." : "Select Pending admission"}</option>
+              {admissions.map((item) => <option key={item.id} value={item.id}>{residents.find((residentItem) => residentItem.id === item.resident_id)?.full_name || "Unknown resident"} — {item.admission_date}</option>)}
+            </select>
+          </label>
 
-        <form onSubmit={handleSubmit} className="space-y-6">
-          <div className="grid gap-5 md:grid-cols-2">
+          {admission && <section className="grid gap-4 rounded-xl border border-slate-200 bg-slate-50 p-4 sm:grid-cols-2 lg:grid-cols-3">
+            <Info label="Resident" value={resident?.full_name || "Unknown"} />
+            <Info label="Room / Bed" value={`${room?.room_number || "Not allocated"} / ${bed ? normalizeBedLabel(bed.bed_number) : "Not allocated"}`} />
+            <Info label="Admission / Start" value={admission.admission_date} />
+            <Info label="Monthly Rent" value={money(admission.monthly_rent)} />
+            <Info label="Security Deposit" value={money(admission.security_deposit)} />
+            <Info label="Contract Status" value="Pending Signature" />
+          </section>}
 
-            <div className="md:col-span-2">
-              <label className="mb-2 block text-sm font-medium">
-                Resident *
-              </label>
+          <label className="block"><span className="mb-2 block text-sm font-medium">End Date (optional)</span><input type="date" value={endDate} onChange={(event) => setEndDate(event.target.value)} disabled={saving} className="w-full rounded-lg border px-3 py-2" /></label>
 
-              <select
-                value={residentId}
-                onChange={(e) => setResidentId(e.target.value)}
-                required
-                disabled={loadingResidents}
-                className="w-full rounded-lg border px-3 py-2"
-              >
-                <option value="">
-                  {loadingResidents
-                    ? "Loading residents..."
-                    : "Select Resident"}
-                </option>
+          {activeTemplate && <section className="rounded-lg border border-gray-300 bg-gray-50 p-4"><h2 className="text-lg font-semibold text-gray-800">{activeTemplate.title}</h2><div className="mt-3 whitespace-pre-wrap text-sm leading-6 text-gray-700">{activeTemplate.content}</div><p className="mt-4 text-xs text-gray-500">These terms are copied into an immutable contract snapshot for the resident to review and accept.</p></section>}
 
-                {residents.map((resident) => (
-                  <option
-                    key={resident.id}
-                    value={resident.id}
-                  >
-                    {resident.full_name}
-                  </option>
-                ))}
-              </select>
-            </div>
+          <label className="block"><span className="mb-2 block text-sm font-medium">Special Clauses / Notes</span><textarea rows={4} value={notes} onChange={(event) => setNotes(event.target.value)} disabled={saving} className="w-full rounded-lg border px-3 py-2" /></label>
+          <label className="block"><span className="mb-2 block text-sm font-medium">Agreement PDF (optional)</span><input type="file" accept="application/pdf,.pdf" onChange={(event) => setAgreementFile(event.target.files?.[0] ?? null)} disabled={saving} className="w-full rounded-lg border p-2" /></label>
 
-            <div>
-              <label className="mb-2 block text-sm font-medium">
-                Start Date *
-              </label>
-
-              <input
-                type="date"
-                value={startDate}
-                onChange={(e) => setStartDate(e.target.value)}
-                required
-                className="w-full rounded-lg border px-3 py-2"
-              />
-            </div>
-
-            <div>
-              <label className="mb-2 block text-sm font-medium">
-                End Date *
-              </label>
-
-              <input
-                type="date"
-                value={endDate}
-                onChange={(e) => setEndDate(e.target.value)}
-                required
-                className="w-full rounded-lg border px-3 py-2"
-              />
-            </div>
-
-            <div>
-              <label className="mb-2 block text-sm font-medium">
-                Monthly Rent *
-              </label>
-
-              <input
-                type="number"
-                value={monthlyRent}
-                onChange={(e) => setMonthlyRent(e.target.value)}
-                required
-                className="w-full rounded-lg border px-3 py-2"
-              />
-            </div>
-
-            <div>
-              <label className="mb-2 block text-sm font-medium">
-                Security Deposit
-              </label>
-
-              <input
-                type="number"
-                value={securityDeposit}
-                onChange={(e) => setSecurityDeposit(e.target.value)}
-                className="w-full rounded-lg border px-3 py-2"
-              />
-            </div>
-
-            <div>
-              <label className="mb-2 block text-sm font-medium">
-                Status
-              </label>
-
-              <select
-                value={contractStatus}
-                onChange={(e) =>
-                  setContractStatus(e.target.value)
-                }
-                className="w-full rounded-lg border px-3 py-2"
-              >
-                <option value="Active">Active</option>
-                <option value="Expired">Expired</option>
-                <option value="Terminated">Terminated</option>
-              </select>
-            </div>
-
-            <div>
-              <label className="mb-2 block text-sm font-medium">
-                Agreement PDF
-              </label>
-
-              <input
-                type="file"
-                accept=".pdf"
-                onChange={(e) =>
-                  setAgreementFile(
-                    e.target.files?.[0] || null
-                  )
-                }
-                className="w-full rounded-lg border p-2"
-              />
-            </div>
-
-          </div>
-          {activeTemplate && (
-  <div className="rounded-lg border border-gray-300 bg-gray-50 p-4">
-    <h3 className="mb-3 text-lg font-semibold text-gray-800">
-      {activeTemplate.title}
-    </h3>
-
-    <div className="whitespace-pre-wrap text-sm text-gray-700">
-      {activeTemplate.content}
-    </div>
-
-    <label className="mt-4 flex items-start gap-3">
-      <input
-        type="checkbox"
-        checked={acceptedTerms}
-        onChange={(event) =>
-          setAcceptedTerms(event.target.checked)
-        }
-        className="mt-1 h-4 w-4"
-      />
-
-      <span className="text-sm text-gray-700">
-        I have read and accept all Terms & Conditions.
-      </span>
-    </label>
-  </div>
-)}
-          <div>
-            <div>
-  <label className="mb-2 block text-sm font-medium text-gray-700">
-    Resident Signature
-  </label>
-
-  <div className="rounded-lg border border-gray-300 bg-white">
-    <SignatureCanvas
-      ref={signatureRef}
-      penColor="black"
-      canvasProps={{
-        width: 700,
-        height: 200,
-        className: "w-full",
-      }}
-    />
-  </div>
-
-  <button
-    type="button"
-    onClick={() => signatureRef.current?.clear()}
-    className="mt-3 rounded-lg bg-red-600 px-4 py-2 text-white"
-  >
-    Clear Signature
-  </button>
-</div>
-            <label className="mb-2 block text-sm font-medium">
-              Notes
-            </label>
-
-            <textarea
-              rows={4}
-              value={notes}
-              onChange={(e) => setNotes(e.target.value)}
-              className="w-full rounded-lg border px-3 py-2"
-            />
-          </div>
-
-          <div className="flex gap-3">
-            <button
-              type="submit"
-              disabled={saving}
-              className="rounded-lg bg-blue-600 px-5 py-2 text-white"
-            >
-              {saving ? "Saving..." : "Save Contract"}
-            </button>
-
-            <Link
-              href="/contracts"
-              className="rounded-lg bg-gray-300 px-5 py-2"
-            >
-              Cancel
-            </Link>
-          </div>
+          <div className="flex gap-3"><button type="submit" disabled={loading || saving || !activeTemplate} className="rounded-lg bg-blue-600 px-5 py-2 text-white disabled:opacity-50">{saving ? "Preparing..." : "Prepare Contract for Resident Signature"}</button><Link href="/contracts" className="rounded-lg bg-gray-300 px-5 py-2">Cancel</Link></div>
         </form>
       </div>
-    </div>
+    </main>
   );
+}
+
+function Info({ label, value }: { label: string; value: string }) {
+  return <div><p className="text-xs font-semibold uppercase tracking-wide text-slate-500">{label}</p><p className="mt-1 font-semibold text-slate-900">{value}</p></div>;
 }

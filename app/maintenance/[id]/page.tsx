@@ -1,318 +1,92 @@
+/* eslint-disable @next/next/no-img-element -- Existing Supabase photo URLs are not restricted to a configured image host. */
 "use client";
 
 import Link from "next/link";
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { useParams } from "next/navigation";
 import { supabase } from "@/lib/supabase";
 
-type MaintenanceRequest = {
-  id: number;
-  complaint_type: string;
-  priority: string;
-  status: string;
-  assigned_to: string | null;
-  description: string | null;
-  request_date: string;
-  completion_date: string | null;
-  maintenance_cost: number | null;
-  residents: {
-    full_name: string;
-  } | null;
-  rooms: {
-    room_number: string;
-  } | null;
+type Row = Record<string, unknown>;
+type Request = {
+  id: string; request_number: string; resident_id: string | null; room_id: string | null;
+  title: string | null; description: string | null; complaint_description: string | null;
+  category: string | null; priority: string | null; status: string | null; assigned_to: string | null;
+  estimated_cost: number | null; actual_cost: number | null; complaint_date: string | null;
+  assigned_date: string | null; completion_date: string | null; completed_at: string | null;
+  work_performed: string | null; parts_replaced: string | null; notes: string | null;
+  photo_url: string | null; before_photos: unknown; during_photos: unknown; after_photos: unknown;
+  created_at: string; updated_at: string;
 };
+type Photo = { id: string; photo_type: string | null; photo_url: string; created_at: string };
+const text = (value: unknown) => value == null ? "" : String(value);
+const name = (row: Row | null, keys: string[], fallback = "—") => keys.map((key) => text(row?.[key]).trim()).find(Boolean) || fallback;
+const list = (value: unknown) => Array.isArray(value) ? value.filter((item): item is string => typeof item === "string" && item.length > 0) : [];
+const money = (value: unknown) => new Intl.NumberFormat("en-PK", { style: "currency", currency: "PKR", maximumFractionDigits: 0 }).format(Number(value || 0));
 
-type MaintenancePhoto = {
-  id: number;
-  photo_type: "Before" | "After";
-  photo_url: string;
-};
-
-export default function MaintenanceViewPage() {
-  const params = useParams();
-  const id = Array.isArray(params.id) ? params.id[0] : params.id;
-
-  const [request, setRequest] =
-    useState<MaintenanceRequest | null>(null);
-
-  const [photos, setPhotos] =
-    useState<MaintenancePhoto[]>([]);
-
+export default function MaintenanceDetailPage() {
+  const { id } = useParams<{ id: string }>();
+  const [request, setRequest] = useState<Request | null>(null);
+  const [resident, setResident] = useState<Row | null>(null);
+  const [room, setRoom] = useState<Row | null>(null);
+  const [photoRows, setPhotoRows] = useState<Photo[]>([]);
   const [loading, setLoading] = useState(true);
-  const [message, setMessage] = useState("");
+  const [error, setError] = useState("");
 
   useEffect(() => {
-    if (id) {
-      fetchRequest();
+    let active = true;
+    async function load() {
+      const [requestResult, photosResult] = await Promise.all([
+        supabase.from("maintenance_requests").select("id,request_number,resident_id,room_id,title,description,complaint_description,category,priority,status,assigned_to,estimated_cost,actual_cost,complaint_date,assigned_date,completion_date,completed_at,work_performed,parts_replaced,notes,photo_url,before_photos,during_photos,after_photos,created_at,updated_at").eq("id", id).maybeSingle(),
+        supabase.from("maintenance_photos").select("id,maintenance_request_id,photo_type,photo_url,created_at").eq("maintenance_request_id", id).order("created_at", { ascending: true }),
+      ]);
+      if (!active) return;
+      if (requestResult.error || !requestResult.data) {
+        setError("The maintenance request could not be loaded. Please refresh and try again.");
+        setLoading(false);
+        return;
+      }
+      const item = requestResult.data as Request;
+      const [residentResult, roomResult] = await Promise.all([
+        item.resident_id ? supabase.from("residents").select("id,full_name,resident_code").eq("id", item.resident_id).maybeSingle() : Promise.resolve({ data: null }),
+        item.room_id ? supabase.from("rooms").select("id,room_number,building_name,block_name,floor_number").eq("id", item.room_id).maybeSingle() : Promise.resolve({ data: null }),
+      ]);
+      if (!active) return;
+      setRequest(item);
+      setResident((residentResult.data ?? null) as Row | null);
+      setRoom((roomResult.data ?? null) as Row | null);
+      setPhotoRows(photosResult.error ? [] : (photosResult.data ?? []) as Photo[]);
+      if (photosResult.error) setError("The request loaded, but some maintenance photos could not be retrieved.");
+      setLoading(false);
     }
+    void load();
+    return () => { active = false; };
   }, [id]);
 
-  async function fetchRequest() {
-    setLoading(true);
-    setMessage("");
+  const galleries = useMemo(() => {
+    if (!request) return [];
+    const rows = (kind: string) => photoRows.filter((photo) => text(photo.photo_type).trim().toLowerCase() === kind).map((photo) => photo.photo_url);
+    const unique = (urls: string[]) => Array.from(new Set(urls.filter(Boolean)));
+    return [
+      { title: "Before Photos", urls: unique([...list(request.before_photos), ...rows("before"), ...(request.photo_url ? [request.photo_url] : [])]) },
+      { title: "During Work Photos", urls: unique([...list(request.during_photos), ...rows("during")]) },
+      { title: "After Photos", urls: unique([...list(request.after_photos), ...rows("after")]) },
+    ];
+  }, [photoRows, request]);
 
-    const { data: requestData, error: requestError } =
-      await supabase
-        .from("maintenance_requests")
-        .select(`
-          id,
-          complaint_type,
-          priority,
-          status,
-          assigned_to,
-          description,
-          request_date,
-          completion_date,
-          maintenance_cost,
-          residents (
-            full_name
-          ),
-          rooms (
-            room_number
-          )
-        `)
-        .eq("id", Number(id))
-        .single();
+  if (loading) return <main className="min-h-screen bg-slate-50 p-8 text-center text-slate-500">Loading maintenance request...</main>;
+  if (!request) return <main className="min-h-screen bg-slate-50 p-8"><div className="mx-auto max-w-4xl rounded-2xl border border-red-200 bg-red-50 p-5 text-red-700">{error || "Maintenance request not found."}</div></main>;
 
-    if (requestError || !requestData) {
-      console.error(requestError);
-      setMessage("Failed to load maintenance request.");
-      setLoading(false);
-      return;
-    }
-
-    const { data: photoData, error: photoError } =
-      await supabase
-        .from("maintenance_photos")
-        .select("id, photo_type, photo_url")
-        .eq("maintenance_id", Number(id))
-        .order("id", { ascending: true });
-
-    if (photoError) {
-      console.error(photoError);
-      setMessage(
-        "Request loaded, but photos could not be loaded."
-      );
-    }
-
-    setRequest(
-      requestData as unknown as MaintenanceRequest
-    );
-
-    setPhotos(
-      (photoData || []) as MaintenancePhoto[]
-    );
-
-    setLoading(false);
-  }
-
-  const beforePhotos = photos.filter(
-    (photo) => photo.photo_type === "Before"
-  );
-
-  const afterPhotos = photos.filter(
-    (photo) => photo.photo_type === "After"
-  );
-
-  if (loading) {
-    return (
-      <div className="p-6">
-        <p className="text-gray-600">
-          Loading maintenance request...
-        </p>
-      </div>
-    );
-  }
-
-  if (!request) {
-    return (
-      <div className="p-6">
-        <p className="mb-4 text-red-600">
-          {message || "Maintenance request not found."}
-        </p>
-
-        <Link
-          href="/maintenance"
-          className="rounded-lg bg-gray-200 px-4 py-2 text-gray-700"
-        >
-          Back to Maintenance
-        </Link>
-      </div>
-    );
-  }
-
-  return (
-    <div className="min-h-screen bg-gray-50 p-6">
-      <div className="mx-auto max-w-5xl">
-        <div className="mb-6 flex items-center justify-between">
-          <div>
-            <h1 className="text-2xl font-bold text-gray-800">
-              Maintenance Request Details
-            </h1>
-
-            <p className="mt-1 text-sm text-gray-500">
-              Request ID: {request.id}
-            </p>
-          </div>
-
-          <div className="flex gap-2">
-            <Link
-              href={`/maintenance/edit/${request.id}`}
-              className="rounded-lg bg-blue-600 px-4 py-2 text-white hover:bg-blue-700"
-            >
-              Edit
-            </Link>
-
-            <Link
-              href="/maintenance"
-              className="rounded-lg bg-gray-200 px-4 py-2 text-gray-700 hover:bg-gray-300"
-            >
-              Back
-            </Link>
-          </div>
-        </div>
-
-        {message && (
-          <div className="mb-5 rounded-lg bg-yellow-50 p-3 text-yellow-700">
-            {message}
-          </div>
-        )}
-
-        <div className="mb-6 rounded-xl bg-white p-6 shadow">
-          <div className="grid gap-5 md:grid-cols-2">
-            <Detail
-              label="Resident"
-              value={
-                request.residents?.full_name || "-"
-              }
-            />
-
-            <Detail
-              label="Room"
-              value={
-                request.rooms?.room_number || "-"
-              }
-            />
-
-            <Detail
-              label="Complaint Type"
-              value={request.complaint_type}
-            />
-
-            <Detail
-              label="Priority"
-              value={request.priority}
-            />
-
-            <Detail
-              label="Status"
-              value={request.status}
-            />
-
-            <Detail
-              label="Assigned To"
-              value={request.assigned_to || "-"}
-            />
-
-            <Detail
-              label="Request Date"
-              value={request.request_date || "-"}
-            />
-
-            <Detail
-              label="Completion Date"
-              value={request.completion_date || "-"}
-            />
-
-            <Detail
-              label="Maintenance Cost"
-              value={String(
-                request.maintenance_cost ?? 0
-              )}
-            />
-          </div>
-
-          <div className="mt-5">
-            <p className="text-sm font-medium text-gray-500">
-              Description
-            </p>
-
-            <p className="mt-1 whitespace-pre-wrap text-gray-800">
-              {request.description || "-"}
-            </p>
-          </div>
-        </div>
-
-        <PhotoSection
-          title="Before Repair Photos"
-          photos={beforePhotos}
-        />
-
-        <PhotoSection
-          title="After Repair Photos"
-          photos={afterPhotos}
-        />
-      </div>
-    </div>
-  );
+  return <main className="min-h-screen bg-slate-50 p-4 sm:p-8"><div className="mx-auto max-w-5xl space-y-6">
+    {error && <p className="rounded-2xl border border-amber-200 bg-amber-50 p-4 text-sm text-amber-700">{error}</p>}
+    <section className="rounded-3xl border border-slate-200 bg-white p-6 shadow-sm"><Link href="/maintenance" className="text-sm font-semibold text-indigo-700">Back to Maintenance</Link><div className="mt-4 flex flex-wrap items-start justify-between gap-3"><div><p className="text-xs font-bold uppercase text-indigo-600">{request.request_number}</p><h1 className="mt-2 text-3xl font-bold">{request.title || "Maintenance Request"}</h1></div><span className="rounded-full bg-amber-100 px-3 py-1 text-xs font-bold text-amber-700">{request.status || "Pending"}</span></div></section>
+    <section className="grid gap-4 rounded-3xl border border-slate-200 bg-white p-6 shadow-sm sm:grid-cols-2 lg:grid-cols-3"><Info label="Resident" value={name(resident, ["full_name"])}/><Info label="Room" value={name(room, ["room_number"])}/><Info label="Location" value={[name(room, ["building_name"], ""), name(room, ["block_name"], ""), name(room, ["floor_number"], "")].filter(Boolean).join(" · ") || "—"}/><Info label="Category" value={request.category || "Other"}/><Info label="Priority" value={request.priority || "Medium"}/><Info label="Assigned To" value={request.assigned_to || "Not assigned"}/><Info label="Complaint Date" value={(request.complaint_date || request.created_at).slice(0, 10)}/><Info label="Estimated Cost" value={money(request.estimated_cost)}/><Info label="Actual Cost" value={money(request.actual_cost)}/></section>
+    <section className="rounded-3xl border border-slate-200 bg-white p-6 shadow-sm"><h2 className="text-xl font-bold">Status Timeline</h2><div className="mt-5 grid gap-3 md:grid-cols-2 lg:grid-cols-5"><Timeline label="Created" date={request.created_at}/><Timeline label="Assigned" date={request.assigned_date}/><Timeline label="In Progress" date={["In Progress", "Completed"].includes(request.status || "") ? request.updated_at : null}/><Timeline label="Completed" date={request.completed_at || request.completion_date}/><Timeline label="Cancelled" date={request.status === "Cancelled" ? request.updated_at : null}/></div></section>
+    <section className="rounded-3xl border border-slate-200 bg-white p-6 shadow-sm"><h2 className="text-lg font-bold">Full Request Information</h2><TextBlock label="Description" value={request.description || request.complaint_description || "No description recorded."}/><TextBlock label="Work Performed" value={request.work_performed || "No work details recorded."}/><TextBlock label="Parts Replaced" value={request.parts_replaced || "No replacement parts recorded."}/><TextBlock label="Resolution Notes" value={request.notes || "No resolution notes recorded."}/></section>
+    {galleries.map((gallery) => <PhotoGallery key={gallery.title} title={gallery.title} urls={gallery.urls}/>) }
+  </div></main>;
 }
 
-function Detail({
-  label,
-  value,
-}: {
-  label: string;
-  value: string;
-}) {
-  return (
-    <div>
-      <p className="text-sm font-medium text-gray-500">
-        {label}
-      </p>
-
-      <p className="mt-1 text-gray-800">
-        {value}
-      </p>
-    </div>
-  );
-}
-
-function PhotoSection({
-  title,
-  photos,
-}: {
-  title: string;
-  photos: MaintenancePhoto[];
-}) {
-  return (
-    <div className="mb-6 rounded-xl bg-white p-6 shadow">
-      <h2 className="mb-4 text-lg font-semibold text-gray-800">
-        {title}
-      </h2>
-
-      {photos.length === 0 ? (
-        <p className="text-gray-500">
-          No photos available.
-        </p>
-      ) : (
-        <div className="grid gap-4 sm:grid-cols-2 md:grid-cols-3">
-          {photos.map((photo) => (
-            <a
-              key={photo.id}
-              href={photo.photo_url}
-              target="_blank"
-              rel="noreferrer"
-            >
-              <img
-                src={photo.photo_url}
-                alt={title}
-                className="h-48 w-full rounded-lg border object-cover hover:opacity-90"
-              />
-            </a>
-          ))}
-        </div>
-      )}
-    </div>
-  );
-}
+function Info({ label, value }: { label: string; value: string }) { return <div className="rounded-2xl bg-slate-50 p-4"><p className="text-xs font-semibold uppercase text-slate-500">{label}</p><p className="mt-2 font-semibold">{value}</p></div>; }
+function Timeline({ label, date }: { label: string; date: string | null }) { return <div className={`rounded-2xl border p-4 ${date ? "border-emerald-200 bg-emerald-50" : "border-slate-200 bg-slate-50"}`}><p className="font-semibold">{label}</p><p className="mt-1 text-xs text-slate-500">{date ? date.slice(0, 10) : "Not recorded"}</p></div>; }
+function TextBlock({ label, value }: { label: string; value: string }) { return <div className="mt-5"><h3 className="text-sm font-bold">{label}</h3><p className="mt-2 whitespace-pre-wrap text-sm leading-6 text-slate-600">{value}</p></div>; }
+function PhotoGallery({ title, urls }: { title: string; urls: string[] }) { if (urls.length === 0) return null; return <section className="rounded-3xl border border-slate-200 bg-white p-6 shadow-sm"><h2 className="text-xl font-bold">{title}</h2><div className="mt-4 grid grid-cols-2 gap-4 md:grid-cols-4">{urls.map((url, index) => <a key={`${url}-${index}`} href={url} target="_blank" rel="noreferrer"><img src={url} alt={`${title} ${index + 1}`} className="h-44 w-full rounded-xl border object-cover"/></a>)}</div></section>; }

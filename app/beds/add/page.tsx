@@ -83,9 +83,9 @@ export default function AddBedPage() {
                 </label>
 
                 <select className="w-full rounded-xl border p-3">
-                  <option>Available</option>
+                  <option>Vacant</option>
                   <option>Occupied</option>
-                  <option>Maintenance</option>
+                  <option>Inactive</option>
                 </select>
 
               </div>

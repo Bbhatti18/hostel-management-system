@@ -16,7 +16,7 @@ const settingsItems: SettingsItem[] = [
     title: "Hostel Information",
     description:
       "Manage hostel name, contact information, address, and business details.",
-    href: "/dashboard/settings/hostel",
+    href: "/settings",
     icon: (
       <svg
         viewBox="0 0 24 24"

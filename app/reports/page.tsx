@@ -1,815 +1,97 @@
 "use client";
 
-import {
-  ReactNode,
-  useCallback,
-  useEffect,
-  useMemo,
-  useState,
-} from "react";
+import { useCallback, useEffect, useMemo, useState, type ReactNode } from "react";
 import { supabase } from "@/lib/supabase";
+import { getSupabaseErrorMessage } from "@/lib/supabaseErrors";
 
-type GenericRow = Record<string, unknown>;
+type Row = Record<string, unknown>;
+type ReportType = "Residents" | "Rooms" | "Beds" | "Admissions" | "Contracts" | "Billing" | "Payments" | "Inspections" | "Maintenance";
+type ReportRecord = { id: string; date: string; status: string; residentIds: string[]; roomIds: string[]; cells: Record<string, string> };
 
-type ReportType =
-  | "Residents"
-  | "Admissions"
-  | "Billing"
-  | "Payments"
-  | "Maintenance"
-  | "Inspections";
-
-const inputClass =
-  "w-full rounded-xl border border-slate-300 bg-white px-3 py-2.5 text-sm text-slate-900 outline-none transition placeholder:text-slate-400 focus:border-indigo-500 focus:ring-4 focus:ring-indigo-100";
-
-function text(value: unknown) {
-  return value == null ? "" : String(value);
-}
-
-function numberValue(value: unknown) {
-  const parsed = Number(value);
-  return Number.isFinite(parsed) ? parsed : 0;
-}
-
-function firstText(row: GenericRow | undefined, keys: string[]) {
-  if (!row) return "";
-
-  for (const key of keys) {
-    const value = row[key];
-
-    if (
-      value !== null &&
-      value !== undefined &&
-      String(value).trim() !== ""
-    ) {
-      return String(value);
-    }
-  }
-
-  return "";
-}
-
-function residentName(row: GenericRow | undefined) {
-  return (
-    firstText(row, ["full_name", "resident_name", "name"]) ||
-    "Unknown resident"
-  );
-}
-
-function roomNumber(row: GenericRow | undefined) {
-  return (
-    firstText(row, ["room_number", "room_no", "number", "name"]) ||
-    "Unknown room"
-  );
-}
-
-function money(value: unknown) {
-  return new Intl.NumberFormat("en-PK", {
-    style: "currency",
-    currency: "PKR",
-    maximumFractionDigits: 0,
-  }).format(numberValue(value));
-}
-
-function dateText(value: unknown) {
-  const raw = text(value);
-  return raw ? raw.slice(0, 10) : "-";
-}
-
-function escapeCsv(value: unknown) {
-  const raw = text(value).replace(/"/g, '""');
-  return `"${raw}"`;
-}
+const REPORT_TYPES: ReportType[] = ["Residents", "Rooms", "Beds", "Admissions", "Contracts", "Billing", "Payments", "Inspections", "Maintenance"];
+const inputClass = "w-full rounded-xl border border-slate-300 bg-white px-3 py-2.5 text-sm text-slate-900 outline-none focus:border-indigo-500 focus:ring-4 focus:ring-indigo-100";
+const text = (value: unknown) => value == null ? "" : String(value);
+const normalized = (value: unknown) => text(value).trim().toLowerCase();
+const numberValue = (value: unknown) => { const parsed = Number(value); return Number.isFinite(parsed) ? parsed : 0; };
+const first = (row: Row | undefined, keys: string[], fallback = "—") => keys.map((key) => text(row?.[key]).trim()).find(Boolean) || fallback;
+const day = (value: unknown) => text(value).slice(0, 10);
+const money = (value: unknown) => new Intl.NumberFormat("en-PK", { style: "currency", currency: "PKR", maximumFractionDigits: 0 }).format(numberValue(value));
+const csv = (value: string) => `"${value.replace(/"/g, '""')}"`;
 
 export default function ReportsPage() {
   const [reportType, setReportType] = useState<ReportType>("Residents");
-  const [fromDate, setFromDate] = useState(
-    new Date(new Date().getFullYear(), new Date().getMonth(), 1)
-      .toISOString()
-      .slice(0, 10)
-  );
-  const [toDate, setToDate] = useState(
-    new Date().toISOString().slice(0, 10)
-  );
-  const [residentFilter, setResidentFilter] = useState("");
-  const [roomFilter, setRoomFilter] = useState("");
-  const [search, setSearch] = useState("");
-
-  const [residents, setResidents] = useState<GenericRow[]>([]);
-  const [rooms, setRooms] = useState<GenericRow[]>([]);
-  const [admissions, setAdmissions] = useState<GenericRow[]>([]);
-  const [bills, setBills] = useState<GenericRow[]>([]);
-  const [payments, setPayments] = useState<GenericRow[]>([]);
-  const [maintenance, setMaintenance] = useState<GenericRow[]>([]);
-  const [inspections, setInspections] = useState<GenericRow[]>([]);
-
-  const [loading, setLoading] = useState(true);
-  const [error, setError] = useState("");
+  const [fromDate, setFromDate] = useState(""); const [toDate, setToDate] = useState("");
+  const [residentFilter, setResidentFilter] = useState(""); const [roomFilter, setRoomFilter] = useState("");
+  const [statusFilter, setStatusFilter] = useState(""); const [search, setSearch] = useState("");
+  const [residents, setResidents] = useState<Row[]>([]); const [rooms, setRooms] = useState<Row[]>([]); const [beds, setBeds] = useState<Row[]>([]);
+  const [admissions, setAdmissions] = useState<Row[]>([]); const [contracts, setContracts] = useState<Row[]>([]); const [bills, setBills] = useState<Row[]>([]);
+  const [payments, setPayments] = useState<Row[]>([]); const [inspections, setInspections] = useState<Row[]>([]); const [legacyInspections, setLegacyInspections] = useState<Row[]>([]); const [maintenance, setMaintenance] = useState<Row[]>([]);
+  const [loading, setLoading] = useState(true); const [error, setError] = useState("");
 
   const refresh = useCallback(async () => {
-    setLoading(true);
-    setError("");
-
-    const [
-      residentsResult,
-      roomsResult,
-      admissionsResult,
-      billsResult,
-      paymentsResult,
-      maintenanceResult,
-      inspectionsResult,
-    ] = await Promise.all([
-      supabase.from("residents").select("*"),
-      supabase.from("rooms").select("*"),
-      supabase.from("admissions").select("*"),
-      supabase.from("bills").select("*"),
-      supabase.from("payments").select("*"),
+    setLoading(true); setError("");
+    const results = await Promise.all([
+      supabase.from("residents").select("*"), supabase.from("rooms").select("*"), supabase.from("beds").select("*"),
+      supabase.from("admissions").select("*"), supabase.from("contracts").select("*"), supabase.from("bills").select("*"),
+      supabase.from("payments").select("*"), supabase.from("room_inspections").select("*"), supabase.from("inspections").select("*"),
       supabase.from("maintenance_requests").select("*"),
-      supabase.from("inspections").select("*"),
     ]);
-
-    const firstError =
-      residentsResult.error ||
-      roomsResult.error ||
-      admissionsResult.error ||
-      billsResult.error ||
-      paymentsResult.error ||
-      maintenanceResult.error ||
-      inspectionsResult.error;
-
-    if (firstError) {
-      setError(firstError.message);
-    } else {
-      setResidents((residentsResult.data ?? []) as GenericRow[]);
-      setRooms((roomsResult.data ?? []) as GenericRow[]);
-      setAdmissions((admissionsResult.data ?? []) as GenericRow[]);
-      setBills((billsResult.data ?? []) as GenericRow[]);
-      setPayments((paymentsResult.data ?? []) as GenericRow[]);
-      setMaintenance((maintenanceResult.data ?? []) as GenericRow[]);
-      setInspections((inspectionsResult.data ?? []) as GenericRow[]);
+    const failed = results.find((result) => result.error)?.error;
+    if (failed) setError(getSupabaseErrorMessage(failed, "Report data could not be loaded. Please refresh and try again."));
+    else {
+      setResidents((results[0].data ?? []) as Row[]); setRooms((results[1].data ?? []) as Row[]); setBeds((results[2].data ?? []) as Row[]);
+      setAdmissions((results[3].data ?? []) as Row[]); setContracts((results[4].data ?? []) as Row[]); setBills((results[5].data ?? []) as Row[]);
+      setPayments((results[6].data ?? []) as Row[]); setInspections((results[7].data ?? []) as Row[]); setLegacyInspections((results[8].data ?? []) as Row[]);
+      setMaintenance((results[9].data ?? []) as Row[]);
     }
-
     setLoading(false);
   }, []);
+  useEffect(() => { const timeout = window.setTimeout(() => void refresh(), 0); return () => window.clearTimeout(timeout); }, [refresh]);
 
-  useEffect(() => {
-    void refresh();
-  }, [refresh]);
+  const residentMap = useMemo(() => new Map(residents.map((row) => [text(row.id), first(row, ["full_name", "name"], "Unknown resident")])), [residents]);
+  const roomMap = useMemo(() => new Map(rooms.map((row) => [text(row.id), first(row, ["room_number", "name"], "Unknown room")])), [rooms]);
+  const bedMap = useMemo(() => new Map(beds.map((row) => [text(row.id), first(row, ["bed_number", "name"], "Unknown bed")])), [beds]);
 
-  const activeAdmissions = useMemo(
-    () =>
-      admissions.filter((row) =>
-        ["active", ""].includes(
-          firstText(row, ["status", "admission_status"]).toLowerCase()
-        )
-      ),
-    [admissions]
-  );
+  const records = useMemo<ReportRecord[]>(() => {
+    const residentName = (id: string) => residentMap.get(id) || "—"; const roomName = (id: string) => roomMap.get(id) || "—";
+    if (reportType === "Residents") return residents.map((row) => ({ id: text(row.id), date: day(row.created_at), status: first(row, ["status"], "Active"), residentIds: [text(row.id)], roomIds: admissions.filter((a) => text(a.resident_id) === text(row.id)).map((a) => text(a.room_id)).filter(Boolean), cells: { "Resident Code": first(row, ["resident_code"]), Resident: first(row, ["full_name", "name"]), Email: first(row, ["email"]), Phone: first(row, ["phone"]), "CNIC / Passport": first(row, ["cnic", "passport_number"]), Status: first(row, ["status"], "Active"), "Created Date": day(row.created_at) || "—" } }));
+    if (reportType === "Rooms") return rooms.map((row) => { const roomBeds = beds.filter((bed) => text(bed.room_id) === text(row.id)); const linkedResidents = admissions.filter((a) => text(a.room_id) === text(row.id)).map((a) => text(a.resident_id)).filter(Boolean); return { id: text(row.id), date: day(row.created_at), status: first(row, ["status"]), residentIds: linkedResidents, roomIds: [text(row.id)], cells: { Room: first(row, ["room_number"]), Building: first(row, ["building_name"]), Floor: first(row, ["floor_number", "floor"]), Type: first(row, ["room_type"]), Status: first(row, ["status"]), Capacity: String(numberValue(row.capacity ?? row.total_beds)), Occupied: String(roomBeds.filter((bed) => normalized(bed.status) === "occupied").length), Vacant: String(roomBeds.filter((bed) => ["vacant", "available"].includes(normalized(bed.status))).length), "Monthly Rent": money(row.monthly_rent) } }; });
+    if (reportType === "Beds") return beds.map((row) => { const activeAdmission = admissions.find((a) => text(a.bed_id) === text(row.id) && normalized(a.status) === "active"); return { id: text(row.id), date: day(row.created_at), status: first(row, ["status"]), residentIds: activeAdmission ? [text(activeAdmission.resident_id)] : [], roomIds: [text(row.room_id)], cells: { Bed: first(row, ["bed_number"]), Room: roomName(text(row.room_id)), Type: first(row, ["bed_type"]), Resident: activeAdmission ? residentName(text(activeAdmission.resident_id)) : "—", Status: first(row, ["status"]), "Monthly Rent": money(row.monthly_rent) } }; });
+    if (reportType === "Admissions") return admissions.map((row) => ({ id: text(row.id), date: day(row.admission_date ?? row.created_at), status: first(row, ["status"]), residentIds: [text(row.resident_id)], roomIds: [text(row.room_id)], cells: { Admission: first(row, ["admission_number"]), Resident: residentName(text(row.resident_id)), Room: roomName(text(row.room_id)), Bed: bedMap.get(text(row.bed_id)) || "—", "Admission Date": day(row.admission_date) || "—", "Expected Leaving": day(row.expected_leaving_date) || "—", Rent: money(row.monthly_rent), Status: first(row, ["status"]) } }));
+    if (reportType === "Contracts") return contracts.map((row) => { const admission = admissions.find((item) => text(item.id) === text(row.admission_id)); const roomId = text(row.room_id) || text(admission?.room_id); return { id: text(row.id), date: day(row.start_date ?? row.created_at), status: first(row, ["status", "contract_status"]), residentIds: [text(row.resident_id)], roomIds: [roomId].filter(Boolean), cells: { Contract: first(row, ["contract_number"]), Resident: residentName(text(row.resident_id)), Room: roomName(roomId), "Start Date": day(row.start_date) || "—", "End Date": day(row.end_date) || "—", Rent: money(row.monthly_rent), "Resident Signature": first(row, ["resident_signature_status"], row.signed_by_resident ? "Signed" : "Pending"), Status: first(row, ["status", "contract_status"]) } }; });
+    if (reportType === "Billing") return bills.map((row) => ({ id: text(row.id), date: day(row.billing_month ?? row.created_at), status: first(row, ["bill_status"]), residentIds: [text(row.resident_id)], roomIds: admissions.filter((a) => text(a.id) === text(row.admission_id)).map((a) => text(a.room_id)), cells: { Bill: first(row, ["bill_number"]), Month: day(row.billing_month) || "—", Resident: residentName(text(row.resident_id)), Rent: money(row.room_rent ?? row.rent_amount), "AC Amount": money(row.ac_bill ?? row.ac_amount), Total: money(row.total_amount), Paid: money(row.paid_amount), Balance: money(row.balance_amount), "Due Date": day(row.due_date) || "—", Status: first(row, ["bill_status"]) } }));
+    if (reportType === "Payments") return payments.map((row) => { const bill = bills.find((item) => text(item.id) === text(row.bill_id)); const admission = admissions.find((item) => text(item.id) === text(bill?.admission_id)); return { id: text(row.id), date: day(row.payment_date ?? row.created_at), status: first(row, ["payment_status"]), residentIds: [text(row.resident_id)], roomIds: [text(admission?.room_id)].filter(Boolean), cells: { Payment: first(row, ["payment_number"]), Date: day(row.payment_date) || "—", Resident: residentName(text(row.resident_id)), Method: first(row, ["payment_method"]), Reference: first(row, ["reference_number"]), Amount: money(row.amount), Status: first(row, ["payment_status"]) } }; });
+    if (reportType === "Inspections") return [...inspections.map((row) => ({ id: text(row.id), date: day(row.inspection_date), status: first(row, ["status"], "Completed"), residentIds: [text(row.resident_id)], roomIds: [text(row.room_id)], cells: { Inspection: first(row, ["inspection_number"], text(row.id)), Date: day(row.inspection_date) || "—", Resident: residentName(text(row.resident_id)), Room: roomName(text(row.room_id)), Type: first(row, ["inspection_type"]), Condition: first(row, ["overall_status"]), Damage: row.damage_found ? first(row, ["damage_description"], "Recorded") : "None", "Estimated Cost": money(row.estimated_damage_cost), Status: first(row, ["status"], "Completed") } })), ...legacyInspections.map((row) => ({ id: `legacy-${text(row.id)}`, date: day(row.inspection_date), status: "Historical", residentIds: [text(row.resident_id)], roomIds: [text(row.room_id)], cells: { Inspection: text(row.id), Date: day(row.inspection_date) || "—", Resident: residentName(text(row.resident_id)), Room: roomName(text(row.room_id)), Type: "Legacy", Condition: "—", Damage: first(row, ["damage_notes"], "None recorded"), "Estimated Cost": "—", Status: "Historical" } }))];
+    return maintenance.map((row) => ({ id: text(row.id), date: day(row.complaint_date ?? row.created_at), status: first(row, ["status"]), residentIds: [text(row.resident_id)], roomIds: [text(row.room_id)], cells: { Request: first(row, ["request_number"]), Date: day(row.complaint_date ?? row.created_at) || "—", Resident: residentName(text(row.resident_id)), Room: roomName(text(row.room_id)), Category: first(row, ["category"]), Priority: first(row, ["priority"]), Description: first(row, ["title", "description", "complaint_description"]), Assigned: first(row, ["assigned_to"], "Not assigned"), "Estimated Cost": money(row.estimated_cost), "Actual Cost": money(row.actual_cost), Status: first(row, ["status"]) } }));
+  }, [admissions, bedMap, beds, bills, contracts, inspections, legacyInspections, maintenance, payments, reportType, residentMap, residents, roomMap, rooms]);
 
-  const verifiedPaymentsTotal = useMemo(
-    () =>
-      payments
-        .filter((row) =>
-          ["verified", "paid", "approved"].includes(
-            firstText(row, ["status", "payment_status"]).toLowerCase()
-          )
-        )
-        .reduce(
-          (sum, row) =>
-            sum +
-            numberValue(
-              row.amount ??
-                row.payment_amount ??
-                row.paid_amount
-            ),
-          0
-        ),
-    [payments]
-  );
+  const statuses = useMemo(() => Array.from(new Set(records.map((record) => record.status).filter(Boolean))).sort(), [records]);
+  const filtered = useMemo(() => { const query = search.trim().toLowerCase(); return records.filter((record) => (!fromDate || !record.date || record.date >= fromDate) && (!toDate || !record.date || record.date <= toDate) && (!residentFilter || record.residentIds.includes(residentFilter)) && (!roomFilter || record.roomIds.includes(roomFilter)) && (!statusFilter || normalized(record.status) === normalized(statusFilter)) && (!query || Object.values(record.cells).join(" ").toLowerCase().includes(query))); }, [fromDate, records, residentFilter, roomFilter, search, statusFilter, toDate]);
 
-  const pendingBillBalance = useMemo(
-    () =>
-      bills.reduce(
-        (sum, row) =>
-          sum +
-          numberValue(
-            row.balance_amount ??
-              row.balance ??
-              row.pending_amount
-          ),
-        0
-      ),
-    [bills]
-  );
+  const summary = useMemo(() => {
+    const count = (values: string[]) => records.filter((record) => values.includes(normalized(record.status))).length;
+    if (reportType === "Residents") return [{ label: "Total", value: residents.length }, { label: "Active", value: residents.filter((r) => normalized(r.status) === "active").length }, { label: "Archived", value: residents.filter((r) => normalized(r.status) === "archived").length }];
+    if (reportType === "Rooms") return [{ label: "Total", value: rooms.length }, { label: "Active", value: rooms.filter((r) => ["active", "available"].includes(normalized(r.status))).length }, { label: "Inactive", value: rooms.filter((r) => normalized(r.status) === "inactive").length }, { label: "Capacity", value: rooms.reduce((sum, r) => sum + numberValue(r.capacity ?? r.total_beds), 0) }, { label: "Occupied", value: beds.filter((b) => normalized(b.status) === "occupied").length }, { label: "Vacant", value: beds.filter((b) => ["vacant", "available"].includes(normalized(b.status))).length }];
+    if (reportType === "Admissions") return ["Active", "Pending", "Completed", "Cancelled"].map((label) => ({ label, value: count([label.toLowerCase()]) }));
+    if (reportType === "Contracts") return [{ label: "Active", value: count(["active"]) }, { label: "Pending Signature", value: contracts.filter((c) => normalized(c.status ?? c.contract_status) === "draft" && !(c.signed_by_resident && c.owner_signature)).length }, { label: "Cancelled", value: count(["cancelled"]) }];
+    if (reportType === "Billing") { const operational = bills.filter((b) => normalized(b.bill_status) !== "cancelled"); return [{ label: "Total Bills", value: bills.length }, { label: "Paid", value: operational.filter((b) => normalized(b.bill_status) === "paid").length }, { label: "Partial", value: operational.filter((b) => normalized(b.bill_status) === "partial").length }, { label: "Pending", value: operational.filter((b) => normalized(b.bill_status) === "pending").length }, { label: "Overdue", value: operational.filter((b) => normalized(b.bill_status) === "overdue").length }, { label: "Outstanding Balance", value: money(operational.reduce((sum, b) => sum + numberValue(b.balance_amount), 0)) }]; }
+    if (reportType === "Payments") { const verified = payments.filter((p) => normalized(p.payment_status) === "verified"); return [{ label: "Verified", value: verified.length }, { label: "Pending", value: payments.filter((p) => normalized(p.payment_status) === "pending").length }, { label: "Rejected", value: payments.filter((p) => normalized(p.payment_status) === "rejected").length }, { label: "Total Received", value: money(verified.reduce((sum, p) => sum + numberValue(p.amount), 0)) }]; }
+    if (reportType === "Maintenance") return ["Pending", "In Progress", "Completed", "Cancelled"].map((label) => ({ label, value: count([label.toLowerCase()]) }));
+    if (reportType === "Inspections") return [{ label: "Completed", value: inspections.filter((i) => normalized(i.status) === "completed").length }, { label: "Historical", value: legacyInspections.length }];
+    return [{ label: "Total", value: records.length }];
+  }, [beds, bills, contracts, inspections, legacyInspections.length, payments, records, reportType, residents, rooms]);
 
-  const reportRows = useMemo(() => {
-    const query = search.trim().toLowerCase();
+  function exportCsv() { if (!filtered.length) { window.alert("No report data is available for the selected filters."); return; } const headers = Object.keys(filtered[0].cells); const content = "\uFEFF" + [headers.map(csv).join(","), ...filtered.map((record) => headers.map((header) => csv(record.cells[header] ?? "")).join(","))].join("\r\n"); const url = URL.createObjectURL(new Blob([content], { type: "text/csv;charset=utf-8" })); const link = document.createElement("a"); link.href = url; link.download = `${reportType.toLowerCase()}-report-${new Date().toISOString().slice(0, 10)}.csv`; link.click(); URL.revokeObjectURL(url); }
+  function changeReport(value: ReportType) { setReportType(value); setStatusFilter(""); setResidentFilter(""); setRoomFilter(""); setSearch(""); }
 
-    const inDateRange = (value: unknown) => {
-      const raw = dateText(value);
-      if (raw === "-") return true;
-      return (!fromDate || raw >= fromDate) && (!toDate || raw <= toDate);
-    };
-
-    const matchesCommon = (
-      row: GenericRow,
-      dateValue: unknown,
-      searchable: string[],
-      residentId?: string,
-      roomId?: string
-    ) => {
-      if (!inDateRange(dateValue)) return false;
-      if (residentFilter && residentId !== residentFilter) return false;
-      if (roomFilter && roomId !== roomFilter) return false;
-      if (!query) return true;
-
-      return searchable.join(" ").toLowerCase().includes(query);
-    };
-
-    if (reportType === "Residents") {
-      return residents.filter((row) =>
-        matchesCommon(
-          row,
-          row.created_at,
-          [
-            residentName(row),
-            firstText(row, ["phone", "contact_number"]),
-            firstText(row, ["email"]),
-            firstText(row, ["cnic"]),
-            firstText(row, ["status", "admission_status"]),
-          ],
-          text(row.id)
-        )
-      );
-    }
-
-    if (reportType === "Admissions") {
-      return admissions.filter((row) => {
-        const residentId = firstText(row, ["resident_id"]);
-        const roomId = firstText(row, ["room_id"]);
-        const resident = residents.find(
-          (item) => text(item.id) === residentId
-        );
-        const room = rooms.find((item) => text(item.id) === roomId);
-
-        return matchesCommon(
-          row,
-          row.admission_date ?? row.created_at,
-          [
-            residentName(resident),
-            roomNumber(room),
-            firstText(row, ["status", "admission_status"]),
-            firstText(row, ["bed_number", "bed_id"]),
-          ],
-          residentId,
-          roomId
-        );
-      });
-    }
-
-    if (reportType === "Billing") {
-      return bills.filter((row) => {
-        const residentId = firstText(row, ["resident_id"]);
-        const resident = residents.find(
-          (item) => text(item.id) === residentId
-        );
-
-        return matchesCommon(
-          row,
-          row.billing_month ?? row.due_date ?? row.created_at,
-          [
-            firstText(row, ["bill_number", "invoice_number"]),
-            residentName(resident),
-            firstText(row, ["billing_month"]),
-            firstText(row, ["bill_status", "status"]),
-          ],
-          residentId
-        );
-      });
-    }
-
-    if (reportType === "Payments") {
-      return payments.filter((row) => {
-        const residentId = firstText(row, ["resident_id"]);
-        const resident = residents.find(
-          (item) => text(item.id) === residentId
-        );
-
-        return matchesCommon(
-          row,
-          row.payment_date ?? row.verified_at ?? row.created_at,
-          [
-            residentName(resident),
-            firstText(row, ["payment_reference", "reference"]),
-            firstText(row, ["status", "payment_status"]),
-            firstText(row, ["payment_method", "method"]),
-          ],
-          residentId
-        );
-      });
-    }
-
-    if (reportType === "Maintenance") {
-      return maintenance.filter((row) => {
-        const residentId = firstText(row, ["resident_id"]);
-        const roomId = firstText(row, ["room_id"]);
-        const resident = residents.find(
-          (item) => text(item.id) === residentId
-        );
-        const room = rooms.find((item) => text(item.id) === roomId);
-
-        return matchesCommon(
-          row,
-          row.created_at,
-          [
-            firstText(row, ["request_number"]),
-            residentName(resident),
-            roomNumber(room),
-            firstText(row, ["title", "category"]),
-            firstText(row, ["priority"]),
-            firstText(row, ["status"]),
-          ],
-          residentId,
-          roomId
-        );
-      });
-    }
-
-    return inspections.filter((row) => {
-      const residentId = firstText(row, ["resident_id"]);
-      const roomId = firstText(row, ["room_id"]);
-      const resident = residents.find(
-        (item) => text(item.id) === residentId
-      );
-      const room = rooms.find((item) => text(item.id) === roomId);
-
-      return matchesCommon(
-        row,
-        row.inspection_date ?? row.created_at,
-        [
-          residentName(resident),
-          roomNumber(room),
-          firstText(row, ["damage_notes"]),
-        ],
-        residentId,
-        roomId
-      );
-    });
-  }, [
-    admissions,
-    bills,
-    fromDate,
-    inspections,
-    maintenance,
-    payments,
-    reportType,
-    residentFilter,
-    residents,
-    roomFilter,
-    rooms,
-    search,
-    toDate,
-  ]);
-
-  function exportCsv() {
-    const rows = getExportRows(
-      reportType,
-      reportRows,
-      residents,
-      rooms
-    );
-
-    if (rows.length === 0) {
-      window.alert("No report data available.");
-      return;
-    }
-
-    const headers = Object.keys(rows[0]);
-    const csv = [
-      headers.map(escapeCsv).join(","),
-      ...rows.map((row) =>
-        headers.map((header) => escapeCsv(row[header])).join(",")
-      ),
-    ].join("\n");
-
-    const blob = new Blob([csv], {
-      type: "text/csv;charset=utf-8;",
-    });
-
-    const url = URL.createObjectURL(blob);
-    const anchor = document.createElement("a");
-    anchor.href = url;
-    anchor.download = `${reportType.toLowerCase()}-report-${fromDate}-${toDate}.csv`;
-    anchor.click();
-    URL.revokeObjectURL(url);
-  }
-
-  return (
-    <main className="min-h-screen bg-slate-50 p-4 sm:p-6 lg:p-8 print:bg-white print:p-0">
-      <div className="mx-auto max-w-7xl space-y-6">
-        <section className="rounded-3xl border border-slate-200 bg-white p-6 shadow-sm print:border-0 print:shadow-none">
-          <p className="text-sm font-semibold uppercase tracking-[0.2em] text-indigo-600">
-            Hostel Management System
-          </p>
-
-          <h1 className="mt-2 text-3xl font-bold text-slate-900">
-            Reports
-          </h1>
-
-          <p className="mt-1 text-sm text-slate-500">
-            View, filter, export and print operational reports.
-          </p>
-        </section>
-
-        {error && (
-          <section className="rounded-2xl border border-red-200 bg-red-50 px-4 py-3 text-sm font-medium text-red-700">
-            {error}
-          </section>
-        )}
-
-        <section className="grid gap-4 sm:grid-cols-2 xl:grid-cols-4 print:hidden">
-          <StatCard label="Residents" value={String(residents.length)} />
-          <StatCard
-            label="Active Admissions"
-            value={String(activeAdmissions.length)}
-          />
-          <StatCard
-            label="Verified Payments"
-            value={money(verifiedPaymentsTotal)}
-          />
-          <StatCard
-            label="Pending Bill Balance"
-            value={money(pendingBillBalance)}
-          />
-        </section>
-
-        <section className="rounded-3xl border border-slate-200 bg-white p-5 shadow-sm print:hidden">
-          <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-4">
-            <Field label="Report Type">
-              <select
-                value={reportType}
-                onChange={(event) =>
-                  setReportType(event.target.value as ReportType)
-                }
-                className={inputClass}
-              >
-                <option value="Residents">Residents</option>
-                <option value="Admissions">Admissions</option>
-                <option value="Billing">Billing</option>
-                <option value="Payments">Payments</option>
-                <option value="Maintenance">Maintenance</option>
-                <option value="Inspections">Inspections</option>
-              </select>
-            </Field>
-
-            <Field label="From Date">
-              <input
-                type="date"
-                value={fromDate}
-                onChange={(event) => setFromDate(event.target.value)}
-                className={inputClass}
-              />
-            </Field>
-
-            <Field label="To Date">
-              <input
-                type="date"
-                value={toDate}
-                onChange={(event) => setToDate(event.target.value)}
-                className={inputClass}
-              />
-            </Field>
-
-            <Field label="Resident">
-              <select
-                value={residentFilter}
-                onChange={(event) =>
-                  setResidentFilter(event.target.value)
-                }
-                className={inputClass}
-              >
-                <option value="">All Residents</option>
-
-                {residents.map((resident) => (
-                  <option
-                    key={text(resident.id)}
-                    value={text(resident.id)}
-                  >
-                    {residentName(resident)}
-                  </option>
-                ))}
-              </select>
-            </Field>
-
-            <Field label="Room">
-              <select
-                value={roomFilter}
-                onChange={(event) =>
-                  setRoomFilter(event.target.value)
-                }
-                className={inputClass}
-              >
-                <option value="">All Rooms</option>
-
-                {rooms.map((room) => (
-                  <option key={text(room.id)} value={text(room.id)}>
-                    {roomNumber(room)}
-                  </option>
-                ))}
-              </select>
-            </Field>
-
-            <div className="md:col-span-2 xl:col-span-3">
-              <Field label="Search">
-                <input
-                  value={search}
-                  onChange={(event) => setSearch(event.target.value)}
-                  className={inputClass}
-                  placeholder="Search current report"
-                />
-              </Field>
-            </div>
-          </div>
-
-          <div className="mt-5 flex flex-wrap gap-3">
-            <button
-              type="button"
-              onClick={() => void refresh()}
-              className="rounded-xl border border-slate-300 px-4 py-2.5 text-sm font-semibold text-slate-700"
-            >
-              Refresh Data
-            </button>
-
-            <button
-              type="button"
-              onClick={exportCsv}
-              className="rounded-xl bg-emerald-600 px-4 py-2.5 text-sm font-semibold text-white"
-            >
-              Export CSV
-            </button>
-
-            <button
-              type="button"
-              onClick={() => window.print()}
-              className="rounded-xl bg-indigo-600 px-4 py-2.5 text-sm font-semibold text-white"
-            >
-              Print / Save PDF
-            </button>
-          </div>
-        </section>
-
-        <section className="rounded-3xl border border-slate-200 bg-white shadow-sm print:border-0 print:shadow-none">
-          <div className="border-b border-slate-200 p-5">
-            <h2 className="text-xl font-bold text-slate-900">
-              {reportType} Report
-            </h2>
-
-            <p className="mt-1 text-sm text-slate-500">
-              Total records: {reportRows.length}
-            </p>
-          </div>
-
-          {loading ? (
-            <p className="p-10 text-center text-sm text-slate-500">
-              Loading report data...
-            </p>
-          ) : (
-            <ReportTable
-              type={reportType}
-              rows={reportRows}
-              residents={residents}
-              rooms={rooms}
-            />
-          )}
-        </section>
-      </div>
-    </main>
-  );
+  return <main className="min-h-screen bg-slate-50 p-4 sm:p-6 lg:p-8 print:bg-white print:p-0"><div className="mx-auto max-w-7xl space-y-6">
+    <section className="rounded-3xl border border-slate-200 bg-white p-6 shadow-sm print:border-0 print:shadow-none"><p className="text-sm font-semibold uppercase tracking-[0.2em] text-indigo-600">StayHub</p><h1 className="mt-2 text-3xl font-bold">Reports</h1><p className="mt-1 text-sm text-slate-500">Search, filter, export, and print verified operational data.</p></section>
+    {error && <p className="rounded-2xl border border-red-200 bg-red-50 p-4 text-sm font-medium text-red-700">{error}</p>}
+    <section className="grid gap-4 sm:grid-cols-2 xl:grid-cols-6 print:hidden">{summary.map((item) => <StatCard key={item.label} label={item.label} value={String(item.value)}/>)}</section>
+    <section className="rounded-3xl border border-slate-200 bg-white p-5 shadow-sm print:hidden"><div className="grid gap-4 md:grid-cols-2 xl:grid-cols-4"><Field label="Report Type"><select value={reportType} onChange={(e) => changeReport(e.target.value as ReportType)} className={inputClass}>{REPORT_TYPES.map((type) => <option key={type} value={type}>{type} Report</option>)}</select></Field><Field label="From Date"><input type="date" value={fromDate} onChange={(e) => setFromDate(e.target.value)} className={inputClass}/></Field><Field label="To Date"><input type="date" value={toDate} onChange={(e) => setToDate(e.target.value)} className={inputClass}/></Field><Field label="Status"><select value={statusFilter} onChange={(e) => setStatusFilter(e.target.value)} className={inputClass}><option value="">All Statuses</option>{statuses.map((status) => <option key={status}>{status}</option>)}</select></Field><Field label="Resident"><select value={residentFilter} onChange={(e) => setResidentFilter(e.target.value)} className={inputClass}><option value="">All Residents</option>{residents.map((resident) => <option key={text(resident.id)} value={text(resident.id)}>{first(resident, ["full_name", "name"])}</option>)}</select></Field><Field label="Room"><select value={roomFilter} onChange={(e) => setRoomFilter(e.target.value)} className={inputClass}><option value="">All Rooms</option>{rooms.map((room) => <option key={text(room.id)} value={text(room.id)}>{first(room, ["room_number", "name"])}</option>)}</select></Field><Field label="Search" wide><input value={search} onChange={(e) => setSearch(e.target.value)} placeholder="Search current report" className={inputClass}/></Field></div><div className="mt-5 flex flex-wrap gap-3"><button type="button" onClick={() => void refresh()} className="rounded-xl border border-slate-300 px-4 py-2.5 text-sm font-semibold">Refresh Data</button><button type="button" onClick={exportCsv} disabled={!filtered.length} className="rounded-xl bg-emerald-600 px-4 py-2.5 text-sm font-semibold text-white disabled:opacity-50">Export CSV</button><button type="button" onClick={() => window.print()} disabled={!filtered.length} className="rounded-xl bg-indigo-600 px-4 py-2.5 text-sm font-semibold text-white disabled:opacity-50">Print / Save PDF</button></div></section>
+    <section className="rounded-3xl border border-slate-200 bg-white shadow-sm print:border-0 print:shadow-none"><div className="border-b p-5"><h2 className="text-xl font-bold">{reportType} Report</h2><p className="mt-1 text-sm text-slate-500">{fromDate || toDate ? `${fromDate || "Beginning"} to ${toDate || "Present"} · ` : ""}{filtered.length} record(s)</p></div><div className="overflow-x-auto"><table className="min-w-full divide-y divide-slate-200"><thead className="bg-slate-50"><tr>{Object.keys(filtered[0]?.cells ?? records[0]?.cells ?? {}).map((header) => <th key={header} className="whitespace-nowrap px-5 py-3 text-left text-xs font-bold uppercase text-slate-500">{header}</th>)}</tr></thead><tbody className="divide-y divide-slate-100">{loading ? <tr><td className="p-10 text-center text-sm text-slate-500">Loading report data...</td></tr> : filtered.length === 0 ? <tr><td className="p-10 text-center text-sm text-slate-500">No records found for the selected filters.</td></tr> : filtered.map((record) => <tr key={record.id}>{Object.entries(record.cells).map(([key, value]) => <td key={`${record.id}-${key}`} className="whitespace-nowrap px-5 py-4 text-sm text-slate-700">{value}</td>)}</tr>)}</tbody></table></div></section>
+  </div></main>;
 }
 
-function Field({
-  label,
-  children,
-}: {
-  label: string;
-  children: ReactNode;
-}) {
-  return (
-    <label>
-      <span className="mb-2 block text-sm font-semibold text-slate-700">
-        {label}
-      </span>
-      {children}
-    </label>
-  );
-}
-
-function StatCard({
-  label,
-  value,
-}: {
-  label: string;
-  value: string;
-}) {
-  return (
-    <article className="rounded-2xl border border-slate-200 bg-white p-5 shadow-sm">
-      <p className="text-sm font-medium text-slate-500">{label}</p>
-      <p className="mt-2 text-2xl font-bold text-slate-900">
-        {value}
-      </p>
-    </article>
-  );
-}
-
-function ReportTable({
-  type,
-  rows,
-  residents,
-  rooms,
-}: {
-  type: ReportType;
-  rows: GenericRow[];
-  residents: GenericRow[];
-  rooms: GenericRow[];
-}) {
-  const exportRows = getExportRows(type, rows, residents, rooms);
-  const headers =
-    exportRows.length > 0 ? Object.keys(exportRows[0]) : [];
-
-  if (exportRows.length === 0) {
-    return (
-      <p className="p-10 text-center text-sm text-slate-500">
-        No records found for the selected filters.
-      </p>
-    );
-  }
-
-  return (
-    <div className="overflow-x-auto">
-      <table className="min-w-full divide-y divide-slate-200">
-        <thead className="bg-slate-50">
-          <tr>
-            {headers.map((header) => (
-              <th
-                key={header}
-                className="px-5 py-3 text-left text-xs font-bold uppercase tracking-wider text-slate-500"
-              >
-                {header}
-              </th>
-            ))}
-          </tr>
-        </thead>
-
-        <tbody className="divide-y divide-slate-100 bg-white">
-          {exportRows.map((row, index) => (
-            <tr key={index}>
-              {headers.map((header) => (
-                <td
-                  key={header}
-                  className="whitespace-nowrap px-5 py-4 text-sm text-slate-700"
-                >
-                  {row[header]}
-                </td>
-              ))}
-            </tr>
-          ))}
-        </tbody>
-      </table>
-    </div>
-  );
-}
-
-function getExportRows(
-  type: ReportType,
-  rows: GenericRow[],
-  residents: GenericRow[],
-  rooms: GenericRow[]
-): Record<string, string>[] {
-  if (type === "Residents") {
-    return rows.map((row) => ({
-      Resident: residentName(row),
-      Phone: firstText(row, ["phone", "contact_number"]) || "-",
-      Email: firstText(row, ["email"]) || "-",
-      CNIC: firstText(row, ["cnic"]) || "-",
-      Status:
-        firstText(row, ["status", "admission_status"]) || "-",
-      Created: dateText(row.created_at),
-    }));
-  }
-
-  if (type === "Admissions") {
-    return rows.map((row) => {
-      const resident = residents.find(
-        (item) =>
-          text(item.id) === firstText(row, ["resident_id"])
-      );
-
-      const room = rooms.find(
-        (item) => text(item.id) === firstText(row, ["room_id"])
-      );
-
-      return {
-        Resident: residentName(resident),
-        Room: roomNumber(room),
-        Bed: firstText(row, ["bed_number", "bed_id"]) || "-",
-        "Admission Date": dateText(
-          row.admission_date ?? row.created_at
-        ),
-        "Expected Leaving": dateText(row.expected_leaving_date),
-        Status:
-          firstText(row, ["status", "admission_status"]) || "-",
-      };
-    });
-  }
-
-  if (type === "Billing") {
-    return rows.map((row) => {
-      const resident = residents.find(
-        (item) =>
-          text(item.id) === firstText(row, ["resident_id"])
-      );
-
-      return {
-        "Bill No.":
-          firstText(row, ["bill_number", "invoice_number"]) || "-",
-        Resident: residentName(resident),
-        Month: dateText(row.billing_month),
-        Total: money(row.total_amount ?? row.total),
-        Paid: money(row.paid_amount),
-        Balance: money(
-          row.balance_amount ?? row.balance ?? row.pending_amount
-        ),
-        Status:
-          firstText(row, ["bill_status", "status"]) || "-",
-      };
-    });
-  }
-
-  if (type === "Payments") {
-    return rows.map((row) => {
-      const resident = residents.find(
-        (item) =>
-          text(item.id) === firstText(row, ["resident_id"])
-      );
-
-      return {
-        Resident: residentName(resident),
-        Amount: money(
-          row.amount ?? row.payment_amount ?? row.paid_amount
-        ),
-        Reference:
-          firstText(row, ["payment_reference", "reference"]) || "-",
-        Method:
-          firstText(row, ["payment_method", "method"]) || "-",
-        Status:
-          firstText(row, ["status", "payment_status"]) || "-",
-        Date: dateText(
-          row.payment_date ?? row.verified_at ?? row.created_at
-        ),
-      };
-    });
-  }
-
-  if (type === "Maintenance") {
-    return rows.map((row) => {
-      const resident = residents.find(
-        (item) =>
-          text(item.id) === firstText(row, ["resident_id"])
-      );
-
-      const room = rooms.find(
-        (item) => text(item.id) === firstText(row, ["room_id"])
-      );
-
-      return {
-        "Request No.": firstText(row, ["request_number"]) || "-",
-        Resident: residentName(resident),
-        Room: roomNumber(room),
-        Issue: firstText(row, ["title", "category"]) || "-",
-        Priority: firstText(row, ["priority"]) || "-",
-        Status: firstText(row, ["status"]) || "-",
-        Cost: money(row.actual_cost ?? row.estimated_cost),
-      };
-    });
-  }
-
-  return rows.map((row) => {
-    const resident = residents.find(
-      (item) =>
-        text(item.id) === firstText(row, ["resident_id"])
-    );
-
-    const room = rooms.find(
-      (item) => text(item.id) === firstText(row, ["room_id"])
-    );
-
-    return {
-      Resident: residentName(resident),
-      Room: roomNumber(room),
-      Date: dateText(row.inspection_date ?? row.created_at),
-      "Before Photo": row.before_photo ? "Yes" : "No",
-      "After Photo": row.after_photo ? "Yes" : "No",
-      "Damage Notes": firstText(row, ["damage_notes"]) || "-",
-    };
-  });
-}
+function Field({ label, wide = false, children }: { label: string; wide?: boolean; children: ReactNode }) { return <label className={wide ? "md:col-span-2" : ""}><span className="mb-2 block text-sm font-semibold text-slate-700">{label}</span>{children}</label>; }
+function StatCard({ label, value }: { label: string; value: string }) { return <article className="rounded-2xl border border-slate-200 bg-white p-5 shadow-sm"><p className="text-sm font-medium text-slate-500">{label}</p><p className="mt-2 text-2xl font-bold">{value}</p></article>; }

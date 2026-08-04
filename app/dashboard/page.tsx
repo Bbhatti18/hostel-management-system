@@ -93,7 +93,7 @@ export default function DashboardPage() {
             <div className="rounded-2xl bg-white p-6 shadow-lg">
 
               <h3 className="text-xl font-bold">
-                Today's Tasks
+                Today&apos;s Tasks
               </h3>
 
               <div className="mt-5 space-y-4">

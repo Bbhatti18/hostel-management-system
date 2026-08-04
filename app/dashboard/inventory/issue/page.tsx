@@ -199,7 +199,8 @@ export default function InventoryIssuePage() {
   };
 
   useEffect(() => {
-    void loadPageData();
+    const timeoutId = window.setTimeout(() => void loadPageData(), 0);
+    return () => window.clearTimeout(timeoutId);
   }, []);
 
   const resetForm = () => {

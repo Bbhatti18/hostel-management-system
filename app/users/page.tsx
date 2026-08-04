@@ -9,6 +9,7 @@ import {
   useState,
 } from "react";
 import { supabase } from "@/lib/supabase";
+import { getSupabaseErrorMessage } from "@/lib/supabaseErrors";
 
 type UserRole =
   | "Super Admin"
@@ -96,7 +97,6 @@ export default function UsersPage() {
   const [statusFilter, setStatusFilter] = useState("All");
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
-  const [deletingId, setDeletingId] = useState<string | null>(null);
   const [message, setMessage] = useState("");
   const [error, setError] = useState("");
 
@@ -110,7 +110,7 @@ export default function UsersPage() {
       .order("created_at", { ascending: false });
 
     if (loadError) {
-      setError(loadError.message);
+      setError(getSupabaseErrorMessage(loadError, "Users could not be loaded."));
       setUsers([]);
     } else {
       setUsers((data ?? []) as StaffUser[]);
@@ -120,7 +120,8 @@ export default function UsersPage() {
   }, []);
 
   useEffect(() => {
-    void refresh();
+    const timeoutId = window.setTimeout(() => void refresh(), 0);
+    return () => window.clearTimeout(timeoutId);
   }, [refresh]);
 
   const filteredUsers = useMemo(() => {
@@ -236,7 +237,7 @@ export default function UsersPage() {
       : await supabase.from("staff_users").insert(payload);
 
     if (result.error) {
-      setError(result.error.message);
+      setError(getSupabaseErrorMessage(result.error, "The user could not be saved.", "A user with this email already exists."));
       setSaving(false);
       return;
     }
@@ -268,38 +269,12 @@ export default function UsersPage() {
       .eq("id", user.id);
 
     if (updateError) {
-      setError(updateError.message);
+      setError(getSupabaseErrorMessage(updateError, "The user status could not be updated."));
       return;
     }
 
     setMessage(`User marked ${nextStatus}.`);
     await refresh();
-  }
-
-  async function deleteUser(user: StaffUser) {
-    const confirmed = window.confirm(
-      `Delete user ${user.full_name}?`
-    );
-
-    if (!confirmed) return;
-
-    setDeletingId(user.id);
-    setMessage("");
-    setError("");
-
-    const { error: deleteError } = await supabase
-      .from("staff_users")
-      .delete()
-      .eq("id", user.id);
-
-    if (deleteError) {
-      setError(deleteError.message);
-    } else {
-      setMessage("User deleted successfully.");
-      await refresh();
-    }
-
-    setDeletingId(null);
   }
 
   return (
@@ -632,16 +607,6 @@ export default function UsersPage() {
                               : "Activate"}
                           </button>
 
-                          <button
-                            type="button"
-                            disabled={deletingId === user.id}
-                            onClick={() => void deleteUser(user)}
-                            className="rounded-lg border border-red-200 px-3 py-2 text-xs font-semibold text-red-700 disabled:opacity-50"
-                          >
-                            {deletingId === user.id
-                              ? "Deleting..."
-                              : "Delete"}
-                          </button>
                         </div>
                       </td>
                     </tr>

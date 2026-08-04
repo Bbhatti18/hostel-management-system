@@ -1,9 +1,7 @@
 "use client";
 
 import { useState, type FormEvent } from "react";
-import { createBrowserClient } from "@/lib/supabase";
-
-const supabase = createBrowserClient();
+import { supabase } from "@/lib/supabase";
 
 export default function LoginPage() {
   const [email, setEmail] = useState("");
@@ -16,9 +14,9 @@ export default function LoginPage() {
     setErrorMessage("");
 
     const normalizedEmail = email.trim();
-    const trimmedPassword = password.trim();
+    const submittedPassword = password;
 
-    if (!normalizedEmail || !trimmedPassword) {
+    if (!normalizedEmail || !submittedPassword) {
       setErrorMessage("Please enter both your email and password.");
       return;
     }
@@ -28,7 +26,7 @@ export default function LoginPage() {
     try {
       const { data: authData, error: signInError } = await supabase.auth.signInWithPassword({
         email: normalizedEmail,
-        password: trimmedPassword,
+        password: submittedPassword,
       });
 
       if (signInError) {
@@ -40,19 +38,14 @@ export default function LoginPage() {
         return;
       }
 
-      const user = authData?.user;
-      if (!user) {
+      if (!authData.session?.user) {
         setErrorMessage("We could not complete the sign-in. Please try again.");
         return;
       }
 
-      const { data: sessionData, error: sessionError } = await supabase.auth.getSession();
-      if (sessionError) {
-        setErrorMessage(`Session error: ${sessionError.message}`);
-        return;
-      }
-
-      if (!sessionData.session) {
+      const { data: verifiedAuth, error: verificationError } = await supabase.auth.getUser();
+      const user = verifiedAuth.user;
+      if (verificationError || !user?.email) {
         setErrorMessage("The sign-in did not create a valid session. Please try again.");
         return;
       }
@@ -75,23 +68,28 @@ export default function LoginPage() {
 
       const { data: residentRecord, error: residentError } = await supabase
         .from("residents")
-        .select("email")
+        .select("id, email, status")
         .ilike("email", lookupEmail)
         .maybeSingle();
 
-      if (!residentError && residentRecord?.email) {
+      const residentIsActive =
+        residentRecord?.email &&
+        String(residentRecord.status ?? "").trim().toLowerCase() !== "archived";
+
+      if (!residentError && residentIsActive) {
         window.location.href = "/resident-portal";
         return;
       }
 
       if (staffError) {
-        setErrorMessage(`Role lookup error: ${staffError.message}`);
+        setErrorMessage("Your account access could not be verified. Please try again.");
       } else if (residentError) {
-        setErrorMessage(`Role lookup error: ${residentError.message}`);
+        setErrorMessage("Your resident profile could not be verified. Please try again.");
       } else {
-        setErrorMessage("Your account does not have access to the system yet.");
+        await supabase.auth.signOut();
+        setErrorMessage("No active resident profile is linked to this account.");
       }
-    } catch (error) {
+    } catch {
       setErrorMessage("Something went wrong while signing you in. Please try again.");
     } finally {
       setIsLoading(false);

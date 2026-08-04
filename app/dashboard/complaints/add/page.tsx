@@ -21,10 +21,6 @@ export default function AddComplaintPage() {
   const [assignedStaff, setAssignedStaff] = useState("");
   const [loading, setLoading] = useState(false);
 
-  useEffect(() => {
-    fetchResidents();
-  }, []);
-
   async function fetchResidents() {
     const { data, error } = await supabase
       .from("residents")
@@ -38,6 +34,11 @@ export default function AddComplaintPage() {
 
     setResidents(data || []);
   }
+
+  useEffect(() => {
+    const timeoutId = window.setTimeout(() => void fetchResidents(), 0);
+    return () => window.clearTimeout(timeoutId);
+  }, []);
 
   async function handleSubmit(e: React.FormEvent<HTMLFormElement>) {
     e.preventDefault();

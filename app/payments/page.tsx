@@ -9,6 +9,12 @@ import {
   useState,
 } from "react";
 import { supabase } from "@/lib/supabase";
+import {
+  getVerifiedPaymentTotal,
+  refreshBillFinancials,
+  roundMoney,
+} from "@/lib/financials";
+import { getSupabaseErrorMessage } from "@/lib/supabaseErrors";
 
 type GenericRow = Record<string, unknown>;
 
@@ -139,7 +145,7 @@ export default function PaymentsPage() {
   const [statusFilter, setStatusFilter] = useState("All");
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
-  const [deletingId, setDeletingId] = useState<string | null>(null);
+  const [cancellingId, setCancellingId] = useState<string | null>(null);
   const [message, setMessage] = useState("");
   const [error, setError] = useState("");
 
@@ -163,7 +169,7 @@ export default function PaymentsPage() {
       paymentsResult.error || residentsResult.error || billsResult.error;
 
     if (firstError) {
-      setError(firstError.message);
+      setError(getSupabaseErrorMessage(firstError, "Financial records could not be loaded."));
       setPayments([]);
       setResidents([]);
       setBills([]);
@@ -177,7 +183,8 @@ export default function PaymentsPage() {
   }, []);
 
   useEffect(() => {
-    void refresh();
+    const timeoutId = window.setTimeout(() => void refresh(), 0);
+    return () => window.clearTimeout(timeoutId);
   }, [refresh]);
 
   const residentMap = useMemo(
@@ -275,6 +282,10 @@ export default function PaymentsPage() {
   }
 
   function openEditForm(payment: Payment) {
+    if (payment.payment_status !== "Pending") {
+      setError("Only pending payments can be edited. Verified and historical payments are preserved.");
+      return;
+    }
     setEditingId(payment.id);
     setForm({
       bill_id: payment.bill_id,
@@ -339,6 +350,86 @@ export default function PaymentsPage() {
       return;
     }
 
+    const { data: currentBill, error: billError } = await supabase
+      .from("bills")
+      .select("id, resident_id, total_amount, bill_status")
+      .eq("id", form.bill_id)
+      .single();
+
+    if (
+      billError ||
+      !currentBill ||
+      text(currentBill.resident_id) !== form.resident_id
+    ) {
+      setError("The selected bill no longer belongs to this resident. Refresh and select the bill again.");
+      setSaving(false);
+      return;
+    }
+
+    if (currentBill.bill_status === "Cancelled") {
+      setError("Payments cannot be recorded against a cancelled bill.");
+      setSaving(false);
+      return;
+    }
+
+    const { data: currentResident, error: residentError } = await supabase
+      .from("residents")
+      .select("id, status")
+      .eq("id", form.resident_id)
+      .single();
+
+    if (residentError || !currentResident) {
+      setError("The selected resident could not be confirmed.");
+      setSaving(false);
+      return;
+    }
+
+    if (!editingId && currentResident.status === "Archived") {
+      setError("Archived residents cannot be selected for new payments.");
+      setSaving(false);
+      return;
+    }
+
+    if (form.reference_number.trim()) {
+      let referenceQuery = supabase
+        .from("payments")
+        .select("id")
+        .eq("reference_number", form.reference_number.trim())
+        .limit(1);
+      if (editingId) referenceQuery = referenceQuery.neq("id", editingId);
+      const { data: duplicateReference, error: referenceError } = await referenceQuery;
+      if (referenceError) {
+        setError("The payment reference could not be checked. Please try again.");
+        setSaving(false);
+        return;
+      }
+      if ((duplicateReference ?? []).length > 0) {
+        setError("This reference number is already used by another payment.");
+        setSaving(false);
+        return;
+      }
+    }
+
+    const verifiedTotal = await getVerifiedPaymentTotal(
+      form.bill_id,
+      editingId ?? undefined,
+    ).catch(() => null);
+    if (verifiedTotal === null) {
+      setError("The latest verified balance could not be confirmed. Please try again.");
+      setSaving(false);
+      return;
+    }
+
+    const outstanding = Math.max(
+      roundMoney(Number(currentBill.total_amount ?? 0) - verifiedTotal),
+      0,
+    );
+    if (amount > outstanding) {
+      setError(`Payment exceeds the current outstanding balance of ${money(outstanding)}.`);
+      setSaving(false);
+      return;
+    }
+
     const isVerified = form.payment_status === "Verified";
 
     const payload = {
@@ -370,8 +461,17 @@ export default function PaymentsPage() {
       : await supabase.from("payments").insert(cleanPayload);
 
     if (result.error) {
-      setError(result.error.message);
+      setError(getSupabaseErrorMessage(result.error, "The payment could not be saved. Please verify the details and try again.", "This payment or reference already exists."));
       setSaving(false);
+      return;
+    }
+
+    try {
+      await refreshBillFinancials(form.bill_id);
+    } catch {
+      setError("The payment was saved, but the bill balance could not be refreshed. Refresh the page and retry the bill update.");
+      setSaving(false);
+      await refresh();
       return;
     }
 
@@ -386,30 +486,65 @@ export default function PaymentsPage() {
     setSaving(false);
   }
 
-  async function deletePayment(payment: Payment) {
+  async function cancelPayment(payment: Payment) {
+    if (payment.payment_status === "Cancelled") return;
     const confirmed = window.confirm(
-      `Delete payment ${payment.payment_number ?? ""}?`
+      `Cancel payment ${payment.payment_number ?? ""}? Its history will be preserved.`
     );
 
     if (!confirmed) return;
 
-    setDeletingId(payment.id);
+    setCancellingId(payment.id);
     setMessage("");
     setError("");
 
-    const { error: deleteError } = await supabase
+    const { data: currentPayment, error: currentPaymentError } = await supabase
       .from("payments")
-      .delete()
-      .eq("id", payment.id);
+      .select("id, bill_id, payment_status")
+      .eq("id", payment.id)
+      .single();
+    if (currentPaymentError || !currentPayment) {
+      setError("The payment could not be re-checked. Refresh and try again.");
+      setCancellingId(null);
+      return;
+    }
+    if (currentPayment.payment_status === "Cancelled") {
+      setError("This payment is already cancelled. No second action was applied.");
+      setCancellingId(null);
+      await refresh();
+      return;
+    }
 
-    if (deleteError) {
-      setError(deleteError.message);
+    const { data: cancelledPayment, error: cancelError } = await supabase
+      .from("payments")
+      .update({
+        payment_status: "Cancelled",
+        verified: false,
+        verified_at: null,
+        verified_by: null,
+        updated_at: new Date().toISOString(),
+      })
+      .eq("id", payment.id)
+      .eq("payment_status", currentPayment.payment_status)
+      .select("id")
+      .maybeSingle();
+
+    if (cancelError || !cancelledPayment) {
+      setError(getSupabaseErrorMessage(cancelError, "The payment could not be cancelled."));
     } else {
-      setMessage("Payment deleted successfully.");
+      try {
+        await refreshBillFinancials(payment.bill_id);
+      } catch {
+        setError("The payment was cancelled, but the bill balance could not be refreshed.");
+        setCancellingId(null);
+        await refresh();
+        return;
+      }
+      setMessage("Payment cancelled. Its history has been preserved.");
       await refresh();
     }
 
-    setDeletingId(null);
+    setCancellingId(null);
   }
 
   return (
@@ -418,7 +553,7 @@ export default function PaymentsPage() {
         <section className="flex flex-col gap-4 rounded-3xl border border-slate-200 bg-white p-6 shadow-sm sm:flex-row sm:items-center sm:justify-between">
           <div>
             <p className="text-sm font-semibold uppercase tracking-[0.2em] text-indigo-600">
-              Hostel Management System
+              StayHub
             </p>
 
             <h1 className="mt-2 text-3xl font-bold text-slate-900">
@@ -485,13 +620,19 @@ export default function PaymentsPage() {
                   >
                     <option value="">Select bill</option>
 
-                    {bills.map((bill) => {
+                    {bills
+                      .filter(
+                        (bill) =>
+                          bill.bill_status !== "Cancelled" ||
+                          text(bill.id) === form.bill_id,
+                      )
+                      .map((bill) => {
                       const id = text(bill.id);
                       const mapped = billMap.get(id);
 
                       return (
                         <option key={id} value={id}>
-                          {mapped?.billNumber ?? "Bill"} â{" "}
+                          {mapped?.billNumber ?? "Bill"} —{" "}
                           {residentMap.get(mapped?.residentId ?? "") ??
                             "Resident"}
                         </option>
@@ -511,7 +652,13 @@ export default function PaymentsPage() {
                   >
                     <option value="">Select resident</option>
 
-                    {residents.map((resident) => (
+                    {residents
+                      .filter(
+                        (resident) =>
+                          resident.status !== "Archived" ||
+                          text(resident.id) === form.resident_id,
+                      )
+                      .map((resident) => (
                       <option
                         key={text(resident.id)}
                         value={text(resident.id)}
@@ -559,7 +706,7 @@ export default function PaymentsPage() {
                   />
                 </Field>
 
-                <Field label="Account Number">
+                <Field label="Account Details">
                   <input
                     value={form.account_number}
                     onChange={(event) =>
@@ -594,8 +741,6 @@ export default function PaymentsPage() {
                   >
                     <option value="Pending">Pending</option>
                     <option value="Verified">Verified</option>
-                    <option value="Rejected">Rejected</option>
-                    <option value="Cancelled">Cancelled</option>
                   </select>
                 </Field>
 
@@ -755,7 +900,7 @@ export default function PaymentsPage() {
                         {payment.payment_method}
 
                         <p className="mt-1 text-xs text-slate-500">
-                          Ref: {payment.reference_number || "â"}
+                          Ref: {payment.reference_number || "—"}
                         </p>
                       </td>
 
@@ -775,23 +920,30 @@ export default function PaymentsPage() {
 
                       <td className="px-5 py-4">
                         <div className="flex flex-wrap gap-2">
-                          <button
-                            type="button"
-                            onClick={() => openEditForm(payment)}
-                            className="rounded-lg border border-indigo-200 px-3 py-2 text-xs font-semibold text-indigo-700"
-                          >
-                            Edit
-                          </button>
+                          {payment.payment_status === "Pending" && (
+                            <button
+                              type="button"
+                              onClick={() => openEditForm(payment)}
+                              className="rounded-lg border border-indigo-200 px-3 py-2 text-xs font-semibold text-indigo-700"
+                            >
+                              Edit
+                            </button>
+                          )}
 
                           <button
                             type="button"
-                            disabled={deletingId === payment.id}
-                            onClick={() => void deletePayment(payment)}
+                            disabled={
+                              cancellingId === payment.id ||
+                              payment.payment_status === "Cancelled"
+                            }
+                            onClick={() => void cancelPayment(payment)}
                             className="rounded-lg border border-red-200 px-3 py-2 text-xs font-semibold text-red-700 disabled:opacity-50"
                           >
-                            {deletingId === payment.id
-                              ? "Deleting..."
-                              : "Delete"}
+                            {cancellingId === payment.id
+                              ? "Cancelling..."
+                              : payment.payment_status === "Cancelled"
+                                ? "Cancelled"
+                                : "Cancel"}
                           </button>
                         </div>
                       </td>

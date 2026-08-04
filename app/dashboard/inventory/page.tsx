@@ -93,7 +93,8 @@ export default function InventoryPage() {
   };
 
   useEffect(() => {
-    loadInventory();
+    const timeoutId = window.setTimeout(() => void loadInventory(), 0);
+    return () => window.clearTimeout(timeoutId);
   }, []);
 
   const categoryOptions = useMemo(() => {

@@ -1,6 +1,7 @@
 "use client";
 
 import {
+  useCallback,
   useEffect,
   useMemo,
   useState,
@@ -349,10 +350,11 @@ export default function ReportsPage() {
   };
 
   useEffect(() => {
-    void loadReports();
+    const timeoutId = window.setTimeout(() => void loadReports(), 0);
+    return () => window.clearTimeout(timeoutId);
   }, []);
 
-  const filterByDate = (
+  const filterByDate = useCallback((
   records: GenericRecord[] = []
 ) => {
   if (!fromDate && !toDate) {
@@ -384,7 +386,7 @@ export default function ReportsPage() {
 
     return true;
   });
-};
+}, [fromDate, toDate]);
 
   const filteredData =
     useMemo(() => {
@@ -427,8 +429,7 @@ export default function ReportsPage() {
       };
     }, [
       reportData,
-      fromDate,
-      toDate,
+      filterByDate,
     ]);
     const summary = useMemo(() => {
     return {

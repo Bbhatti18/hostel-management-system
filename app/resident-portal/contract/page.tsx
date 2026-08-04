@@ -1,210 +1,425 @@
 "use client";
 
-type ContractStatus = "Active" | "Pending Signature" | "Expired";
-type SignatureStatus = "Signed" | "Pending";
+import Link from "next/link";
+import {
+  ChangeEvent,
+  FormEvent,
+  useCallback,
+  useEffect,
+  useRef,
+  useState,
+} from "react";
+import SignatureCanvas from "react-signature-canvas";
+import { normalizeBedLabel } from "@/lib/bedLabels";
+import {
+  getLatestContractAgreement,
+  uploadResidentSignature,
+} from "@/lib/contractStorage";
+import { getContractTerms, hasResidentSignature } from "@/lib/contractWorkflow";
+import { resolveAuthenticatedResident } from "@/lib/residentPortalAuth";
+import { supabase } from "@/lib/supabase";
+import { getSupabaseErrorMessage } from "@/lib/supabaseErrors";
 
 type Contract = {
-  contractNumber: string;
+  id: string;
+  contract_number: string;
+  resident_id: string;
+  admission_id: string | null;
+  template_id: number | null;
+  contract_content: string | null;
+  terms: string | null;
+  start_date: string;
+  end_date: string | null;
+  notice_period_days: number;
+  status: string | null;
+  contract_status: string | null;
+  resident_signature: string | null;
+  resident_signature_url: string | null;
+  resident_signature_status: string | null;
+  owner_signature_status: string | null;
+  signed_by_resident: boolean | null;
+  signed_at: string | null;
+};
+
+type Admission = {
+  id: string;
+  resident_id: string;
+  room_id: string | null;
+  bed_id: string | null;
+  admission_date: string;
+  monthly_rent: number;
+  security_deposit: number;
+  status: string;
+};
+
+type PortalContract = {
+  contract: Contract;
+  admission: Admission;
   residentName: string;
   roomNumber: string;
   bedNumber: string;
-  admissionDate: string;
-  startDate: string;
-  endDate: string;
-  monthlyRent: number;
-  securityDeposit: number;
-  noticePeriodDays: number;
-  residentSignatureStatus: SignatureStatus;
-  ownerSignatureStatus: SignatureStatus;
-  status: ContractStatus;
+  agreementUrl: string | null;
 };
 
-const contract: Contract = {
-  contractNumber: "CNT-2026-0001",
-  residentName: "Bilal",
-  roomNumber: "101",
-  bedNumber: "B1",
-  admissionDate: "2026-07-31",
-  startDate: "2026-07-31",
-  endDate: "2027-07-30",
-  monthlyRent: 15000,
-  securityDeposit: 15000,
-  noticePeriodDays: 30,
-  residentSignatureStatus: "Signed",
-  ownerSignatureStatus: "Signed",
-  status: "Active",
-};
+const pendingStatuses = new Set(["Draft", "Pending Signature"]);
+const signatureUploadTypes = new Set(["image/png", "image/jpeg"]);
+const maxSignatureBytes = 5 * 1024 * 1024;
 
 function money(value: number) {
   return new Intl.NumberFormat("en-PK", {
     style: "currency",
     currency: "PKR",
     maximumFractionDigits: 0,
-  }).format(value);
-}
-
-function badgeClass(value: string) {
-  if (value === "Active" || value === "Signed") {
-    return "bg-emerald-100 text-emerald-700";
-  }
-
-  if (value === "Expired") {
-    return "bg-red-100 text-red-700";
-  }
-
-  return "bg-amber-100 text-amber-700";
+  }).format(value || 0);
 }
 
 export default function ResidentContractPage() {
+  const signatureRef = useRef<SignatureCanvas | null>(null);
+  const [data, setData] = useState<PortalContract | null>(null);
+  const [acceptedTerms, setAcceptedTerms] = useState(false);
+  const [signatureFile, setSignatureFile] = useState<File | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState("");
+  const [message, setMessage] = useState("");
+
+  const loadContract = useCallback(async () => {
+    setLoading(true);
+    setError("");
+
+    const auth = await resolveAuthenticatedResident();
+    if (!auth.resident) {
+      setData(null);
+      setError(auth.error || "Your resident account could not be verified.");
+      setLoading(false);
+      return;
+    }
+
+    const { data: contractRows, error: contractError } = await supabase
+      .from("contracts")
+      .select(
+        "id, contract_number, resident_id, admission_id, template_id, contract_content, terms, start_date, end_date, notice_period_days, status, contract_status, resident_signature, resident_signature_url, resident_signature_status, owner_signature_status, signed_by_resident, signed_at, created_at",
+      )
+      .eq("resident_id", auth.resident.id)
+      .order("created_at", { ascending: false });
+
+    if (contractError) {
+      setError(getSupabaseErrorMessage(contractError, "Unable to load your contract."));
+      setLoading(false);
+      return;
+    }
+
+    const contract = ((contractRows ?? []) as Contract[]).find((item) => {
+      const status = item.status || item.contract_status || "Draft";
+      return pendingStatuses.has(status) || status === "Active";
+    });
+
+    if (!contract?.admission_id) {
+      setData(null);
+      setError("No contract is currently prepared for your admission.");
+      setLoading(false);
+      return;
+    }
+
+    const { data: admission, error: admissionError } = await supabase
+      .from("admissions")
+      .select(
+        "id, resident_id, room_id, bed_id, admission_date, monthly_rent, security_deposit, status",
+      )
+      .eq("id", contract.admission_id)
+      .eq("resident_id", auth.resident.id)
+      .maybeSingle();
+
+    if (admissionError || !admission) {
+      setError(
+        admissionError
+          ? getSupabaseErrorMessage(admissionError, "Unable to verify your admission.")
+          : "This contract is not linked to your current admission.",
+      );
+      setLoading(false);
+      return;
+    }
+
+    const [roomResult, bedResult] = await Promise.all([
+      admission.room_id
+        ? supabase.from("rooms").select("room_number").eq("id", admission.room_id).maybeSingle()
+        : Promise.resolve({ data: null, error: null }),
+      admission.bed_id
+        ? supabase.from("beds").select("bed_number").eq("id", admission.bed_id).maybeSingle()
+        : Promise.resolve({ data: null, error: null }),
+    ]);
+
+    if (roomResult.error || bedResult.error) {
+      setError("Unable to load the room and bed assigned to this contract.");
+      setLoading(false);
+      return;
+    }
+
+    let agreementUrl: string | null = null;
+    try {
+      agreementUrl = await getLatestContractAgreement(contract.id);
+    } catch {
+      // The agreement PDF is optional; the immutable contract terms remain available.
+    }
+
+    setData({
+      contract,
+      admission: admission as Admission,
+      residentName: auth.resident.full_name || "Resident",
+      roomNumber: roomResult.data?.room_number || "Not allocated",
+      bedNumber: bedResult.data?.bed_number
+        ? normalizeBedLabel(bedResult.data.bed_number)
+        : "Not allocated",
+      agreementUrl,
+    });
+    setLoading(false);
+  }, []);
+
+  useEffect(() => {
+    // Loading the authenticated resident contract is the external synchronization.
+    // eslint-disable-next-line react-hooks/set-state-in-effect
+    void loadContract();
+  }, [loadContract]);
+
+  function selectSignatureFile(event: ChangeEvent<HTMLInputElement>) {
+    const file = event.target.files?.[0] ?? null;
+    setError("");
+    if (!file) {
+      setSignatureFile(null);
+      return;
+    }
+    if (!signatureUploadTypes.has(file.type)) {
+      setSignatureFile(null);
+      event.target.value = "";
+      setError("Upload a PNG, JPG, or JPEG signature image.");
+      return;
+    }
+    if (file.size > maxSignatureBytes) {
+      setSignatureFile(null);
+      event.target.value = "";
+      setError("The signature image must be 5 MB or smaller.");
+      return;
+    }
+    setSignatureFile(file);
+  }
+
+  async function signContract(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    if (!data) return;
+
+    setSaving(true);
+    setError("");
+    setMessage("");
+
+    try {
+      if (!acceptedTerms) throw new Error("Accept the contract terms before signing.");
+      const hasDrawnSignature = !signatureRef.current?.isEmpty();
+      if (!hasDrawnSignature && !signatureFile) {
+        throw new Error("Draw or upload your signature before submitting.");
+      }
+
+      const auth = await resolveAuthenticatedResident();
+      if (!auth.resident || auth.resident.id !== data.contract.resident_id) {
+        throw new Error("Your resident account could not be verified for this contract.");
+      }
+
+      const [contractResult, admissionResult] = await Promise.all([
+        supabase
+          .from("contracts")
+          .select(
+            "id, resident_id, admission_id, template_id, contract_content, terms, status, contract_status, resident_signature, resident_signature_url, resident_signature_status, signed_by_resident, signed_at",
+          )
+          .eq("id", data.contract.id)
+          .eq("resident_id", auth.resident.id)
+          .maybeSingle(),
+        supabase
+          .from("admissions")
+          .select("id, resident_id, status")
+          .eq("id", data.admission.id)
+          .eq("resident_id", auth.resident.id)
+          .maybeSingle(),
+      ]);
+
+      const verificationError = contractResult.error || admissionResult.error;
+      if (verificationError) {
+        throw new Error(
+          getSupabaseErrorMessage(verificationError, "Unable to verify the contract before signing."),
+        );
+      }
+
+      const current = contractResult.data as Contract | null;
+      if (!current || current.admission_id !== data.admission.id) {
+        throw new Error("This contract is no longer available for your admission.");
+      }
+      if (!admissionResult.data || admissionResult.data.status !== "Pending") {
+        throw new Error("Only a Pending admission contract can be signed.");
+      }
+      if (!current.template_id || !getContractTerms(current)) {
+        throw new Error("This contract does not contain complete terms. Please contact management.");
+      }
+      if ((current.status || current.contract_status) !== "Pending Signature") {
+        throw new Error("This contract is not awaiting a resident signature.");
+      }
+      const signatureStatus = current.resident_signature_status || "Pending";
+      if (!["Pending", "Re-sign Required"].includes(signatureStatus)) {
+        throw new Error("This contract has already been signed.");
+      }
+
+      let signatureBlob: Blob;
+      let signatureFileName = "resident-signature.png";
+      if (signatureFile) {
+        if (
+          !signatureUploadTypes.has(signatureFile.type) ||
+          signatureFile.size > maxSignatureBytes
+        ) {
+          throw new Error("Upload a PNG, JPG, or JPEG signature image no larger than 5 MB.");
+        }
+        signatureBlob = signatureFile;
+        signatureFileName = signatureFile.name;
+      } else {
+        const dataUrl = signatureRef.current!
+          .getTrimmedCanvas()
+          .toDataURL("image/png");
+        signatureBlob = await fetch(dataUrl).then((response) => response.blob());
+      }
+      const signatureUrl = await uploadResidentSignature(
+        current.id,
+        signatureBlob,
+        signatureFileName,
+      );
+      const signedAt = new Date().toISOString();
+      const { data: signedContract, error: updateError } = await supabase
+        .from("contracts")
+        .update({
+          resident_signature: signatureUrl,
+          resident_signature_url: signatureUrl,
+          resident_signature_status: "Submitted",
+          signed_by_resident: true,
+          signed_at: signedAt,
+          status: "Pending Signature",
+          contract_status: "Pending Signature",
+          updated_at: signedAt,
+        })
+        .eq("id", current.id)
+        .eq("resident_id", auth.resident.id)
+        .select("id")
+        .maybeSingle();
+
+      if (updateError || !signedContract) {
+        throw new Error(
+          updateError
+            ? getSupabaseErrorMessage(updateError, "The signature was uploaded but could not be linked to the contract. Contact an administrator.")
+            : "The contract changed before signing completed. Refresh and try again.",
+        );
+      }
+
+      setAcceptedTerms(false);
+      setSignatureFile(null);
+      setMessage("Signature submitted successfully and is awaiting admin approval. Your admission remains Pending.");
+      await loadContract();
+    } catch (signError) {
+      setError(signError instanceof Error ? signError.message : "Unable to sign this contract.");
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  if (loading) {
+    return <main className="min-h-screen bg-slate-50 p-8 text-slate-600">Loading your contract...</main>;
+  }
+
+  if (!data) {
+    return (
+      <main className="min-h-screen bg-slate-50 p-6">
+        <div className="mx-auto max-w-3xl rounded-3xl border border-slate-200 bg-white p-8 shadow-sm">
+          <h1 className="text-2xl font-bold text-slate-900">Resident Contract</h1>
+          <p className="mt-4 rounded-2xl bg-red-50 p-4 text-sm text-red-700">{error}</p>
+          <Link href="/resident-portal" className="mt-6 inline-block text-sm font-semibold text-indigo-700">Back to portal</Link>
+        </div>
+      </main>
+    );
+  }
+
+  const terms = getContractTerms(data.contract);
+  const signed = hasResidentSignature(data.contract);
+  const signatureStatus = data.contract.resident_signature_status || "Pending";
+  const canSubmitSignature =
+    data.admission.status === "Pending" &&
+    ["Pending", "Re-sign Required"].includes(signatureStatus);
+  const displayStatus = signed && data.admission.status === "Pending" ? `${signatureStatus} — Awaiting Admin` : data.contract.status || data.contract.contract_status || "Pending Signature";
+
   return (
     <main className="min-h-screen bg-slate-50 p-4 sm:p-6 lg:p-8">
       <div className="mx-auto max-w-5xl space-y-6">
-        <section className="flex flex-col gap-4 rounded-3xl border border-slate-200 bg-white p-6 shadow-sm sm:flex-row sm:items-center sm:justify-between">
-          <div>
-            <p className="text-sm font-semibold uppercase tracking-[0.2em] text-indigo-600">
-              Hostel Management System
-            </p>
-
-            <h1 className="mt-2 text-3xl font-bold text-slate-900">
-              Resident Contract
-            </h1>
-
-            <p className="mt-1 text-sm text-slate-500">
-              View your contract, rent, security deposit and signature status.
-            </p>
+        <section className="rounded-3xl border border-slate-200 bg-white p-6 shadow-sm">
+          <p className="text-sm font-semibold uppercase tracking-[0.2em] text-indigo-600">Hostel Management System</p>
+          <div className="mt-2 flex flex-wrap items-center justify-between gap-3">
+            <h1 className="text-3xl font-bold text-slate-900">Resident Contract</h1>
+            <span className="rounded-full bg-amber-100 px-4 py-2 text-sm font-bold text-amber-800">{displayStatus}</span>
           </div>
+          <p className="mt-2 text-sm text-slate-500">Signing confirms acceptance of the terms. It does not activate your admission.</p>
+        </section>
 
-          <span
-            className={`inline-flex w-fit rounded-full px-4 py-2 text-sm font-bold ${badgeClass(
-              contract.status
-            )}`}
-          >
-            {contract.status}
-          </span>
+        {(message || error) && <div className={`rounded-2xl border p-4 text-sm font-medium ${error ? "border-red-200 bg-red-50 text-red-700" : "border-emerald-200 bg-emerald-50 text-emerald-700"}`}>{error || message}</div>}
+
+        <section className="grid gap-4 rounded-3xl border border-slate-200 bg-white p-6 shadow-sm sm:grid-cols-2 xl:grid-cols-3">
+          <InfoCard label="Contract Number" value={data.contract.contract_number} />
+          <InfoCard label="Resident" value={data.residentName} />
+          <InfoCard label="Room / Bed" value={`${data.roomNumber} / ${data.bedNumber}`} />
+          <InfoCard label="Admission Date" value={data.admission.admission_date} />
+          <InfoCard label="Start / End" value={`${data.contract.start_date} / ${data.contract.end_date || "Open-ended"}`} />
+          <InfoCard label="Monthly Rent" value={money(data.admission.monthly_rent)} />
+          <InfoCard label="Security Deposit" value={money(data.admission.security_deposit)} />
+          <InfoCard label="Notice Period" value={`${data.contract.notice_period_days || 30} days`} />
+          <InfoCard label="Resident Signature" value={signatureStatus} />
         </section>
 
         <section className="rounded-3xl border border-slate-200 bg-white p-6 shadow-sm">
-          <div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-3">
-            <InfoCard label="Contract Number" value={contract.contractNumber} />
-            <InfoCard label="Resident" value={contract.residentName} />
-            <InfoCard label="Room" value={contract.roomNumber} />
-            <InfoCard label="Bed" value={contract.bedNumber} />
-            <InfoCard label="Admission Date" value={contract.admissionDate} />
-            <InfoCard label="Start Date" value={contract.startDate} />
-            <InfoCard label="End Date" value={contract.endDate} />
-            <InfoCard label="Monthly Rent" value={money(contract.monthlyRent)} />
-            <InfoCard
-              label="Security Deposit"
-              value={money(contract.securityDeposit)}
-            />
-            <InfoCard
-              label="Notice Period"
-              value={`${contract.noticePeriodDays} days`}
-            />
-          </div>
+          <h2 className="text-xl font-bold text-slate-900">Contract Terms</h2>
+          {terms ? <div className="mt-4 whitespace-pre-wrap rounded-2xl bg-slate-50 p-5 text-sm leading-7 text-slate-700">{terms}</div> : <p className="mt-4 text-sm text-red-700">No immutable contract terms are available. Signing is blocked.</p>}
+          {data.agreementUrl && <a href={data.agreementUrl} target="_blank" rel="noopener noreferrer" className="mt-4 inline-block text-sm font-semibold text-indigo-700">Download agreement PDF</a>}
         </section>
 
-        <section className="grid gap-6 md:grid-cols-2">
-          <article className="rounded-3xl border border-slate-200 bg-white p-6 shadow-sm">
-            <h2 className="text-xl font-bold text-slate-900">
-              Signature Status
-            </h2>
-
-            <div className="mt-5 space-y-4">
-              <SignatureRow
-                label="Resident Signature"
-                status={contract.residentSignatureStatus}
-              />
-
-              <SignatureRow
-                label="Owner Signature"
-                status={contract.ownerSignatureStatus}
-              />
+        {canSubmitSignature && (
+          <form onSubmit={signContract} className="space-y-5 rounded-3xl border border-slate-200 bg-white p-6 shadow-sm">
+            <div>
+              <h2 className="text-xl font-bold text-slate-900">Resident Declaration</h2>
+              <p className="mt-2 text-sm text-slate-600">Confirm your acceptance and provide either a drawn or uploaded handwritten signature.</p>
             </div>
-          </article>
+            <label className="flex items-start gap-3 text-sm text-slate-700">
+              <input type="checkbox" checked={acceptedTerms} onChange={(event) => setAcceptedTerms(event.target.checked)} disabled={saving || !terms} className="mt-1 h-4 w-4" />
+              <span>I have read and agree to all contract terms and hostel rules.</span>
+            </label>
+            <div>
+              <p className="mb-2 text-sm font-semibold text-slate-700">Draw digital signature</p>
+              <div className="overflow-hidden rounded-xl border border-slate-300 bg-white">
+                <SignatureCanvas ref={signatureRef} penColor="black" canvasProps={{ width: 900, height: 220, className: "w-full" }} />
+              </div>
+              <button type="button" onClick={() => signatureRef.current?.clear()} disabled={saving} className="mt-3 rounded-lg border border-slate-300 px-4 py-2 text-sm font-semibold text-slate-700">Clear</button>
+            </div>
+            <div className="rounded-2xl border border-slate-200 p-4">
+              <p className="text-center text-sm font-bold uppercase tracking-wide text-slate-500">OR</p>
+              <label className="mt-3 block">
+                <span className="mb-2 block text-sm font-semibold text-slate-700">Upload handwritten signature</span>
+                <input type="file" accept="image/png,image/jpeg,.png,.jpg,.jpeg" onChange={selectSignatureFile} disabled={saving} className="w-full rounded-xl border border-slate-300 p-2 text-sm" />
+                <span className="mt-2 block text-xs text-slate-500">PNG, JPG, or JPEG; maximum 5 MB.</span>
+              </label>
+            </div>
+            <button type="submit" disabled={saving || !terms} className="rounded-xl bg-indigo-600 px-5 py-3 text-sm font-semibold text-white disabled:cursor-not-allowed disabled:opacity-50">{saving ? "Submitting Signature..." : "Submit Signature"}</button>
+          </form>
+        )}
 
-          <article className="rounded-3xl border border-slate-200 bg-white p-6 shadow-sm">
-            <h2 className="text-xl font-bold text-slate-900">
-              Security Deposit Rule
-            </h2>
-
-            <p className="mt-4 text-sm leading-6 text-slate-600">
-              Security deposit is refundable only when notice is served at
-              least {contract.noticePeriodDays} days before leaving.
-            </p>
-          </article>
-        </section>
-
-        <section className="rounded-3xl border border-slate-200 bg-white p-6 shadow-sm">
-          <h2 className="text-xl font-bold text-slate-900">
-            Contract Terms
-          </h2>
-
-          <ol className="mt-5 space-y-3 text-sm leading-6 text-slate-700">
-            <li className="rounded-2xl bg-slate-50 p-4">
-              1. Monthly rent must be paid by the due date.
-            </li>
-            <li className="rounded-2xl bg-slate-50 p-4">
-              2. Room and bed allocation is decided by the owner.
-            </li>
-            <li className="rounded-2xl bg-slate-50 p-4">
-              3. Damage charges may be deducted from the security deposit.
-            </li>
-            <li className="rounded-2xl bg-slate-50 p-4">
-              4. Residents must follow hostel rules and inspection procedures.
-            </li>
-          </ol>
-        </section>
-
-        <section className="flex flex-wrap gap-3 print:hidden">
-          <button
-            type="button"
-            onClick={() => window.print()}
-            className="rounded-xl bg-indigo-600 px-5 py-3 text-sm font-semibold text-white hover:bg-indigo-700"
-          >
-            Print / Save PDF
-          </button>
-        </section>
+        {!canSubmitSignature && signed && (
+          <section className="rounded-3xl border border-slate-200 bg-white p-6 shadow-sm">
+            <h2 className="text-xl font-bold text-slate-900">Signature Submitted</h2>
+            <p className="mt-2 text-sm text-slate-600">Your signature can no longer be edited. Management must approve it or request a re-sign.</p>
+          </section>
+        )}
       </div>
     </main>
   );
 }
 
-function InfoCard({
-  label,
-  value,
-}: {
-  label: string;
-  value: string;
-}) {
-  return (
-    <article className="rounded-2xl border border-slate-200 bg-slate-50 p-4">
-      <p className="text-xs font-semibold uppercase tracking-wide text-slate-500">
-        {label}
-      </p>
-      <p className="mt-2 font-semibold text-slate-900">{value}</p>
-    </article>
-  );
-}
-
-function SignatureRow({
-  label,
-  status,
-}: {
-  label: string;
-  status: SignatureStatus;
-}) {
-  return (
-    <div className="flex items-center justify-between gap-4 rounded-2xl border border-slate-200 p-4">
-      <span className="text-sm font-semibold text-slate-700">{label}</span>
-
-      <span
-        className={`rounded-full px-3 py-1 text-xs font-bold ${badgeClass(
-          status
-        )}`}
-      >
-        {status}
-      </span>
-    </div>
-  );
+function InfoCard({ label, value }: { label: string; value: string }) {
+  return <article className="rounded-2xl border border-slate-200 bg-slate-50 p-4"><p className="text-xs font-semibold uppercase tracking-wide text-slate-500">{label}</p><p className="mt-2 font-semibold text-slate-900">{value}</p></article>;
 }

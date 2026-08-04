@@ -22,10 +22,6 @@ export default function AddVisitorPage() {
   const [notes, setNotes] = useState("");
   const [loading, setLoading] = useState(false);
 
-  useEffect(() => {
-    fetchResidents();
-  }, []);
-
   async function fetchResidents() {
     const { data, error } = await supabase
       .from("residents")
@@ -39,6 +35,11 @@ export default function AddVisitorPage() {
 
     setResidents(data || []);
   }
+
+  useEffect(() => {
+    const timeoutId = window.setTimeout(() => void fetchResidents(), 0);
+    return () => window.clearTimeout(timeoutId);
+  }, []);
 
   async function handleSubmit(e: React.FormEvent<HTMLFormElement>) {
     e.preventDefault();

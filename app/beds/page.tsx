@@ -9,6 +9,26 @@ import {
   useState,
 } from "react";
 import { supabase } from "@/lib/supabase";
+import {
+  prepareRoomBedCapacity,
+  provisionRoomBeds,
+  rollbackRoomBedChanges,
+  type BedCapacityResult,
+} from "@/lib/bedProvisioning";
+import { getSupabaseErrorMessage } from "@/lib/supabaseErrors";
+import {
+  canonicalBedLabelKey,
+  compareBedRecordsAscending,
+  normalizeBedLabel,
+  parseBedNumber,
+} from "@/lib/bedLabels";
+import {
+  BED_STATUS,
+  type BedStatus,
+  type ReadableBedStatus,
+  isOperationalBedStatus,
+  isVacantBedStatus,
+} from "@/lib/statuses";
 
 type RoomStatus = "Available" | "Occupied" | "Maintenance" | "Inactive";
 
@@ -31,7 +51,7 @@ type Bed = {
   id: string;
   room_id: string;
   bed_number: string;
-  status: "Vacant" | "Occupied" | "Maintenance" | "Inactive";
+  status: ReadableBedStatus;
   mattress_condition: string | null;
   mattress_cover: string | null;
   created_at: string;
@@ -51,7 +71,7 @@ type RoomForm = {
 type BedForm = {
   room_id: string;
   bed_number: string;
-  status: Bed["status"];
+  status: BedStatus;
   mattress_condition: string;
   mattress_cover: string;
 };
@@ -70,7 +90,7 @@ const emptyRoomForm: RoomForm = {
 const emptyBedForm: BedForm = {
   room_id: "",
   bed_number: "",
-  status: "Vacant",
+  status: BED_STATUS.VACANT,
   mattress_condition: "Good",
   mattress_cover: "Available",
 };
@@ -88,7 +108,6 @@ function roomStatusClass(status: RoomStatus) {
 function bedStatusClass(status: Bed["status"]) {
   if (status === "Vacant") return "bg-emerald-100 text-emerald-700";
   if (status === "Occupied") return "bg-blue-100 text-blue-700";
-  if (status === "Maintenance") return "bg-amber-100 text-amber-700";
   return "bg-slate-200 text-slate-700";
 }
 
@@ -103,6 +122,15 @@ function money(value: number | null) {
 export default function RoomsPage() {
   const [rooms, setRooms] = useState<Room[]>([]);
   const [beds, setBeds] = useState<Bed[]>([]);
+  const [referencedBedIds, setReferencedBedIds] = useState<Set<string>>(
+    new Set(),
+  );
+  const [referencedRoomIds, setReferencedRoomIds] = useState<Set<string>>(
+    new Set(),
+  );
+  const [expandedInactiveRoomIds, setExpandedInactiveRoomIds] = useState<
+    Set<string>
+  >(new Set());
   const [roomForm, setRoomForm] = useState<RoomForm>(emptyRoomForm);
   const [bedForm, setBedForm] = useState<BedForm>(emptyBedForm);
   const [editingRoomId, setEditingRoomId] = useState<string | null>(null);
@@ -120,14 +148,18 @@ export default function RoomsPage() {
     setLoading(true);
     setError("");
 
-    const [{ data: roomsData, error: roomsError }, { data: bedsData, error: bedsError }] =
-      await Promise.all([
+    const [
+      { data: roomsData, error: roomsError },
+      { data: bedsData, error: bedsError },
+      { data: admissionData, error: admissionError },
+    ] = await Promise.all([
         supabase.from("rooms").select("*").order("room_number"),
         supabase.from("beds").select("*").order("bed_number"),
+        supabase.from("admissions").select("bed_id, room_id"),
       ]);
 
     if (roomsError) {
-      setError(roomsError.message);
+      setError(getSupabaseErrorMessage(roomsError, "Rooms could not be loaded."));
       setRooms([]);
     } else {
       setRooms((roomsData ?? []) as Room[]);
@@ -135,17 +167,50 @@ export default function RoomsPage() {
 
     if (bedsError) {
       setError((current) =>
-        current ? `${current} | ${bedsError.message}` : bedsError.message
+        current
+          ? `${current} Beds could not be loaded.`
+          : getSupabaseErrorMessage(bedsError, "Beds could not be loaded.")
       );
       setBeds([]);
     } else {
       setBeds((bedsData ?? []) as Bed[]);
     }
 
+    if (admissionError) {
+      setError((current) =>
+        current
+          ? `${current} | Unable to verify room and bed references.`
+          : "Unable to verify room and bed references.",
+      );
+      setReferencedBedIds(new Set());
+      setReferencedRoomIds(new Set());
+    } else {
+      const references = (admissionData ?? []) as Array<{
+        bed_id: string | null;
+        room_id: string | null;
+      }>;
+      setReferencedBedIds(
+        new Set(
+          references
+            .map((reference) => reference.bed_id)
+            .filter((id): id is string => Boolean(id)),
+        ),
+      );
+      setReferencedRoomIds(
+        new Set(
+          references
+            .map((reference) => reference.room_id)
+            .filter((id): id is string => Boolean(id)),
+        ),
+      );
+    }
+
     setLoading(false);
   }, []);
 
   useEffect(() => {
+    // Loading remote Supabase data is the external synchronization for this effect.
+    // eslint-disable-next-line react-hooks/set-state-in-effect
     void refresh();
   }, [refresh]);
 
@@ -168,9 +233,15 @@ export default function RoomsPage() {
   }, [rooms, search, statusFilter]);
 
   const summary = useMemo(() => {
-    const totalBeds = beds.length;
-    const occupiedBeds = beds.filter((bed) => bed.status === "Occupied").length;
-    const vacantBeds = beds.filter((bed) => bed.status === "Vacant").length;
+    const totalBeds = beds.filter((bed) =>
+      isOperationalBedStatus(bed.status),
+    ).length;
+    const occupiedBeds = beds.filter(
+      (bed) => bed.status === BED_STATUS.OCCUPIED,
+    ).length;
+    const vacantBeds = beds.filter((bed) =>
+      isVacantBedStatus(bed.status),
+    ).length;
 
     return {
       totalRooms: rooms.length,
@@ -180,6 +251,19 @@ export default function RoomsPage() {
       vacantBeds,
     };
   }, [rooms, beds]);
+
+  const roomsWithBedCapacity = useMemo(
+    () =>
+      rooms.filter(
+        (room) =>
+          room.status !== "Inactive" &&
+          beds.filter(
+            (bed) =>
+              bed.room_id === room.id && isOperationalBedStatus(bed.status),
+          ).length < room.capacity,
+      ),
+    [rooms, beds],
+  );
 
   function updateRoomField<K extends keyof RoomForm>(
     key: K,
@@ -193,6 +277,15 @@ export default function RoomsPage() {
     value: BedForm[K]
   ) {
     setBedForm((current) => ({ ...current, [key]: value }));
+  }
+
+  function toggleInactiveBeds(roomId: string) {
+    setExpandedInactiveRoomIds((current) => {
+      const next = new Set(current);
+      if (next.has(roomId)) next.delete(roomId);
+      else next.add(roomId);
+      return next;
+    });
   }
 
   function openAddRoom() {
@@ -222,9 +315,31 @@ export default function RoomsPage() {
   }
 
   function openAddBed(roomId = "") {
+    const selectedRoom = roomId
+      ? rooms.find((room) => room.id === roomId)
+      : roomsWithBedCapacity[0];
+
+    if (!selectedRoom || selectedRoom.status === "Inactive") {
+      setError("No active room currently has space for another bed.");
+      setShowBedForm(false);
+      return;
+    }
+
+    const existingBedCount = beds.filter(
+      (bed) =>
+        bed.room_id === selectedRoom.id && isOperationalBedStatus(bed.status),
+    ).length;
+    if (existingBedCount >= selectedRoom.capacity) {
+      setError(
+        `Room ${selectedRoom.room_number} is at capacity. Increase its capacity before adding another bed.`,
+      );
+      setShowBedForm(false);
+      return;
+    }
+
     setBedForm({
       ...emptyBedForm,
-      room_id: roomId || rooms[0]?.id || "",
+      room_id: selectedRoom.id,
     });
     setShowBedForm(true);
     setShowRoomForm(false);
@@ -244,12 +359,14 @@ export default function RoomsPage() {
       return;
     }
 
+    const capacity = Math.max(1, Number(roomForm.capacity) || 1);
     const payload = {
       room_number: roomForm.room_number.trim(),
       building_name: roomForm.building_name.trim() || null,
       floor: roomForm.floor.trim() || null,
       room_type: roomForm.room_type.trim() || null,
-      capacity: Math.max(1, Number(roomForm.capacity) || 1),
+      capacity,
+      total_beds: capacity,
       status: roomForm.status,
       monthly_rent: roomForm.monthly_rent
         ? Number(roomForm.monthly_rent)
@@ -258,20 +375,87 @@ export default function RoomsPage() {
       updated_at: new Date().toISOString(),
     };
 
-    const result = editingRoomId
-      ? await supabase.from("rooms").update(payload).eq("id", editingRoomId)
-      : await supabase.from("rooms").insert(payload);
+    let bedCapacityResult: BedCapacityResult | null = null;
+    if (editingRoomId) {
+      bedCapacityResult = await prepareRoomBedCapacity({
+        roomId: editingRoomId,
+        capacity,
+        allowIncrease: roomForm.status !== "Inactive",
+      });
+      if (bedCapacityResult.error) {
+        setError(bedCapacityResult.error);
+        setSavingRoom(false);
+        return;
+      }
+    }
 
-    if (result.error) {
-      setError(result.error.message);
-    } else {
-      setMessage(
-        editingRoomId ? "Room updated successfully." : "Room added successfully."
+    const result = editingRoomId
+      ? await supabase
+          .from("rooms")
+          .update(payload)
+          .eq("id", editingRoomId)
+          .select("id")
+          .single()
+      : await supabase.from("rooms").insert(payload).select("id").single();
+
+    if (result.error || !result.data) {
+      const rolledBack = bedCapacityResult
+        ? await rollbackRoomBedChanges(bedCapacityResult)
+        : true;
+      setError(
+        rolledBack
+          ? getSupabaseErrorMessage(result.error, "The room could not be saved. No bed changes were kept.")
+          : "The room could not be saved, and some bed statuses could not be restored. Refresh and review this room before trying again.",
       );
+    } else {
+      let partialSuccessError = "";
+      const savedRoomId = String(result.data.id);
+      if (!editingRoomId && roomForm.status !== "Inactive") {
+        const provisionResult = await provisionRoomBeds({
+          roomId: savedRoomId,
+          capacity,
+        });
+
+        if (provisionResult.errors.length > 0) {
+          partialSuccessError = `Room saved, but only ${provisionResult.created} of ${provisionResult.requested} missing beds were created. Refresh and retry after resolving the database error.`;
+        } else {
+          setMessage(
+            `${editingRoomId ? "Room updated" : "Room added"} successfully.${
+              provisionResult.created > 0
+                ? ` ${provisionResult.created} vacant bed${
+                    provisionResult.created === 1 ? " was" : "s were"
+                  } created automatically.`
+                : ""
+            }`,
+          );
+        }
+      } else if (!editingRoomId) {
+        setMessage(
+          `${editingRoomId ? "Room updated" : "Room added"} successfully. No beds were created because the room is Inactive.`,
+        );
+      } else {
+        const changes = bedCapacityResult!;
+        setMessage(
+          `Room updated successfully.${
+            changes.deactivated > 0
+              ? ` ${changes.deactivated} surplus bed${changes.deactivated === 1 ? " was" : "s were"} marked Inactive.`
+              : ""
+          }${
+            changes.restored > 0
+              ? ` ${changes.restored} inactive bed${changes.restored === 1 ? " was" : "s were"} restored as Vacant.`
+              : ""
+          }${
+            changes.created > 0
+              ? ` ${changes.created} new vacant bed${changes.created === 1 ? " was" : "s were"} created.`
+              : ""
+          }`,
+        );
+      }
       setShowRoomForm(false);
       setRoomForm(emptyRoomForm);
       setEditingRoomId(null);
       await refresh();
+      if (partialSuccessError) setError(partialSuccessError);
     }
 
     setSavingRoom(false);
@@ -289,16 +473,77 @@ export default function RoomsPage() {
       return;
     }
 
+    const selectedRoom = rooms.find((room) => room.id === bedForm.room_id);
+    const existingBedCount = beds.filter(
+      (bed) =>
+        bed.room_id === bedForm.room_id && isOperationalBedStatus(bed.status),
+    ).length;
+
+    if (!selectedRoom) {
+      setError("The selected room could not be found.");
+      setSavingBed(false);
+      return;
+    }
+
+    if (existingBedCount >= selectedRoom.capacity) {
+      setError(
+        `Room ${selectedRoom.room_number} is at its capacity of ${selectedRoom.capacity} beds. Increase the room capacity before adding another bed.`,
+      );
+      setSavingBed(false);
+      return;
+    }
+
+    if (selectedRoom.status === "Inactive") {
+      setError("Beds cannot be added to an Inactive room.");
+      setSavingBed(false);
+      return;
+    }
+
+    const parsedBedNumber = parseBedNumber(bedForm.bed_number);
+    if (parsedBedNumber === null) {
+      setError("Bed number must include a positive whole number.");
+      setSavingBed(false);
+      return;
+    }
+
+    const canonicalBedNumber = normalizeBedLabel(bedForm.bed_number);
+    const canonicalKey = canonicalBedLabelKey(canonicalBedNumber);
+    const { data: currentRoomBeds, error: duplicateCheckError } = await supabase
+      .from("beds")
+      .select("id, bed_number")
+      .eq("room_id", bedForm.room_id)
+      .order("created_at", { ascending: true });
+
+    if (duplicateCheckError) {
+      setError("The bed number could not be verified. Nothing was saved.");
+      setSavingBed(false);
+      return;
+    }
+
+    if (
+      (currentRoomBeds ?? []).some(
+        (bed) => canonicalBedLabelKey(bed.bed_number) === canonicalKey,
+      )
+    ) {
+      setError("A bed with this number already exists in the selected room.");
+      setSavingBed(false);
+      return;
+    }
+
     const { error: bedError } = await supabase.from("beds").insert({
       room_id: bedForm.room_id,
-      bed_number: bedForm.bed_number.trim(),
-      status: bedForm.status,
+      bed_number: canonicalBedNumber,
+      status: BED_STATUS.VACANT,
       mattress_condition: bedForm.mattress_condition.trim() || null,
       mattress_cover: bedForm.mattress_cover.trim() || null,
     });
 
     if (bedError) {
-      setError(bedError.message);
+      setError(
+        /foreign key|constraint|23503/i.test(bedError.message)
+          ? "The selected room is no longer available. Refresh the page and choose an active room."
+          : getSupabaseErrorMessage(bedError, "The bed could not be added."),
+      );
     } else {
       setMessage("Bed added successfully.");
       setShowBedForm(false);
@@ -310,34 +555,110 @@ export default function RoomsPage() {
   }
 
   async function deleteRoom(room: Room) {
-    if (!window.confirm(`Delete room ${room.room_number}?`)) return;
+    const hasLinks =
+      beds.some((bed) => bed.room_id === room.id) ||
+      referencedRoomIds.has(room.id);
+    const action = hasLinks ? "mark this room Inactive" : "delete this room";
+
+    if (!window.confirm(`Are you sure you want to ${action}?`)) return;
 
     setMessage("");
     setError("");
 
-    const { error: deleteError } = await supabase
-      .from("rooms")
-      .delete()
-      .eq("id", room.id);
+    const result = hasLinks
+      ? await supabase
+          .from("rooms")
+          .update({ status: "Inactive" })
+          .eq("id", room.id)
+      : await supabase.from("rooms").delete().eq("id", room.id);
 
-    if (deleteError) {
-      setError(deleteError.message);
+    if (
+      result.error &&
+      !hasLinks &&
+      /foreign key|constraint|23503/i.test(result.error.message)
+    ) {
+      const { error: inactiveError } = await supabase
+        .from("rooms")
+        .update({ status: "Inactive" })
+        .eq("id", room.id);
+
+      if (!inactiveError) {
+        setMessage("Room marked Inactive. Linked records were preserved.");
+        await refresh();
+        return;
+      }
+    }
+
+    if (result.error) {
+      setError(
+        /foreign key|constraint|23503/i.test(result.error.message)
+          ? "This room is linked to beds, admissions, or other records and cannot be deleted. Mark it Inactive instead."
+          : "The room could not be updated. Please try again.",
+      );
     } else {
-      setMessage("Room deleted successfully.");
+      setMessage(
+        hasLinks
+          ? "Room marked Inactive. Linked records were preserved."
+          : "Room deleted successfully.",
+      );
       await refresh();
     }
   }
 
   async function deleteBed(bed: Bed) {
-    if (!window.confirm(`Delete bed ${bed.bed_number}?`)) return;
+    if (
+      bed.status === BED_STATUS.OCCUPIED ||
+      referencedBedIds.has(bed.id)
+    ) {
+      setError("Allocated or referenced beds cannot be deleted.");
+      return;
+    }
 
-    const { error: deleteError } = await supabase
+    if (!window.confirm(`Delete ${normalizeBedLabel(bed.bed_number)}?`)) return;
+
+    const { data: currentBed, error: bedCheckError } = await supabase
+      .from("beds")
+      .select("id, status")
+      .eq("id", bed.id)
+      .maybeSingle();
+    const { data: admissionReference, error: referenceError } = await supabase
+      .from("admissions")
+      .select("id")
+      .eq("bed_id", bed.id)
+      .limit(1)
+      .maybeSingle();
+
+    if (bedCheckError || referenceError) {
+      setError("The bed allocation could not be verified. Nothing was deleted.");
+      return;
+    }
+
+    if (
+      !currentBed ||
+      currentBed.status === BED_STATUS.OCCUPIED ||
+      admissionReference
+    ) {
+      setError("Allocated or referenced beds cannot be deleted.");
+      await refresh();
+      return;
+    }
+
+    const { data: deletedBed, error: deleteError } = await supabase
       .from("beds")
       .delete()
-      .eq("id", bed.id);
+      .eq("id", bed.id)
+      .neq("status", BED_STATUS.OCCUPIED)
+      .select("id")
+      .maybeSingle();
 
     if (deleteError) {
-      setError(deleteError.message);
+      setError(
+        /foreign key|constraint|23503/i.test(deleteError.message)
+          ? "This bed is referenced by an admission or another record and cannot be deleted."
+          : "The bed could not be deleted. Please try again.",
+      );
+    } else if (!deletedBed) {
+      setError("The bed is no longer eligible for deletion.");
     } else {
       setMessage("Bed deleted successfully.");
       await refresh();
@@ -371,7 +692,8 @@ export default function RoomsPage() {
             <button
               type="button"
               onClick={() => openAddBed()}
-              className="rounded-xl bg-emerald-600 px-5 py-3 text-sm font-semibold text-white hover:bg-emerald-700"
+              disabled={roomsWithBedCapacity.length === 0}
+              className="rounded-xl bg-emerald-600 px-5 py-3 text-sm font-semibold text-white hover:bg-emerald-700 disabled:cursor-not-allowed disabled:opacity-50"
             >
               + Add Bed
             </button>
@@ -562,7 +884,7 @@ export default function RoomsPage() {
                     className={inputClass}
                   >
                     <option value="">Select room</option>
-                    {rooms.map((room) => (
+                    {roomsWithBedCapacity.map((room) => (
                       <option key={room.id} value={room.id}>
                         {room.room_number}
                       </option>
@@ -585,18 +907,10 @@ export default function RoomsPage() {
                 <Field label="Status">
                   <select
                     value={bedForm.status}
-                    onChange={(event) =>
-                      updateBedField(
-                        "status",
-                        event.target.value as Bed["status"]
-                      )
-                    }
+                    disabled
                     className={inputClass}
                   >
-                    <option value="Vacant">Vacant</option>
-                    <option value="Occupied">Occupied</option>
-                    <option value="Maintenance">Maintenance</option>
-                    <option value="Inactive">Inactive</option>
+                    <option value={BED_STATUS.VACANT}>Vacant</option>
                   </select>
                 </Field>
 
@@ -709,9 +1023,22 @@ export default function RoomsPage() {
             ) : (
               filteredRooms.map((room) => {
                 const roomBeds = beds.filter((bed) => bed.room_id === room.id);
-                const occupied = roomBeds.filter(
-                  (bed) => bed.status === "Occupied"
+                const activeRoomBeds = roomBeds
+                  .filter((bed) => isOperationalBedStatus(bed.status))
+                  .sort(compareBedRecordsAscending);
+                const inactiveRoomBeds = roomBeds
+                  .filter((bed) => bed.status === BED_STATUS.INACTIVE)
+                  .sort(compareBedRecordsAscending);
+                const inactiveExpanded = expandedInactiveRoomIds.has(room.id);
+                const occupied = activeRoomBeds.filter(
+                  (bed) => bed.status === BED_STATUS.OCCUPIED,
                 ).length;
+                const roomHasLinks =
+                  roomBeds.length > 0 || referencedRoomIds.has(room.id);
+                const canAddBed =
+                  room.status !== "Inactive" &&
+                  activeRoomBeds.length < room.capacity;
+                const exceedsCapacity = activeRoomBeds.length > room.capacity;
 
                 return (
                   <article
@@ -734,20 +1061,22 @@ export default function RoomsPage() {
                         </div>
 
                         <p className="mt-2 text-sm text-slate-500">
-                          {room.building_name || "No building"} Â·{" "}
-                          {room.floor || "No floor"} Â·{" "}
+                          {room.building_name || "No building"} ·{" "}
+                          {room.floor || "No floor"} ·{" "}
                           {room.room_type || "No type"}
                         </p>
                       </div>
 
                       <div className="flex flex-wrap gap-2">
-                        <button
-                          type="button"
-                          onClick={() => openAddBed(room.id)}
-                          className="rounded-lg border border-emerald-200 px-3 py-2 text-xs font-semibold text-emerald-700"
-                        >
-                          Add Bed
-                        </button>
+                        {canAddBed && (
+                          <button
+                            type="button"
+                            onClick={() => openAddBed(room.id)}
+                            className="rounded-lg border border-emerald-200 px-3 py-2 text-xs font-semibold text-emerald-700"
+                          >
+                            Add Bed
+                          </button>
+                        )}
                         <button
                           type="button"
                           onClick={() => openEditRoom(room)}
@@ -760,16 +1089,23 @@ export default function RoomsPage() {
                           onClick={() => void deleteRoom(room)}
                           className="rounded-lg border border-red-200 px-3 py-2 text-xs font-semibold text-red-700"
                         >
-                          Delete
+                          {roomHasLinks ? "Mark Inactive" : "Delete"}
                         </button>
                       </div>
                     </div>
+
+                    {exceedsCapacity && (
+                      <p className="mt-4 rounded-2xl border border-amber-200 bg-amber-50 px-4 py-3 text-sm font-medium text-amber-800">
+                        This room has more beds than its configured capacity.
+                        Increase the room capacity before adding more beds.
+                      </p>
+                    )}
 
                     <div className="mt-5 grid gap-4 sm:grid-cols-2 xl:grid-cols-4">
                       <InfoCard label="Capacity" value={String(room.capacity)} />
                       <InfoCard
                         label="Beds Added"
-                        value={String(roomBeds.length)}
+                        value={String(activeRoomBeds.length)}
                       />
                       <InfoCard
                         label="Occupied Beds"
@@ -786,50 +1122,58 @@ export default function RoomsPage() {
                         Beds
                       </h3>
 
-                      {roomBeds.length === 0 ? (
+                      {activeRoomBeds.length === 0 ? (
                         <p className="mt-3 rounded-2xl bg-slate-50 p-4 text-sm text-slate-500">
-                          No beds added yet.
+                          No operational beds.
                         </p>
                       ) : (
                         <div className="mt-3 grid gap-3 md:grid-cols-2 xl:grid-cols-3">
-                          {roomBeds.map((bed) => (
-                            <div
+                          {activeRoomBeds.map((bed) => (
+                            <BedCard
                               key={bed.id}
-                              className="rounded-2xl border border-slate-200 bg-slate-50 p-4"
-                            >
-                              <div className="flex items-center justify-between gap-3">
-                                <p className="font-bold text-slate-900">
-                                  Bed {bed.bed_number}
-                                </p>
-                                <span
-                                  className={`rounded-full px-3 py-1 text-xs font-bold ${bedStatusClass(
-                                    bed.status
-                                  )}`}
-                                >
-                                  {bed.status}
-                                </span>
-                              </div>
-
-                              <p className="mt-3 text-xs text-slate-600">
-                                Mattress:{" "}
-                                {bed.mattress_condition || "Not recorded"}
-                              </p>
-                              <p className="mt-1 text-xs text-slate-600">
-                                Cover: {bed.mattress_cover || "Not recorded"}
-                              </p>
-
-                              <button
-                                type="button"
-                                onClick={() => void deleteBed(bed)}
-                                className="mt-3 text-xs font-semibold text-red-700"
-                              >
-                                Delete Bed
-                              </button>
-                            </div>
+                              bed={bed}
+                              canDelete={
+                                bed.status !== BED_STATUS.OCCUPIED &&
+                                !referencedBedIds.has(bed.id)
+                              }
+                              onDelete={() => void deleteBed(bed)}
+                            />
                           ))}
                         </div>
                       )}
                     </div>
+
+                    {inactiveRoomBeds.length > 0 && (
+                      <div className="mt-5 border-t border-slate-200 pt-5">
+                        <div className="flex flex-wrap items-center justify-between gap-3">
+                          <h3 className="text-sm font-bold text-slate-900">
+                            Inactive / Historical Beds ({inactiveRoomBeds.length})
+                          </h3>
+                          <button
+                            type="button"
+                            aria-expanded={inactiveExpanded}
+                            aria-controls={`inactive-beds-${room.id}`}
+                            onClick={() => toggleInactiveBeds(room.id)}
+                            className="rounded-lg border border-slate-300 px-3 py-2 text-xs font-semibold text-slate-700 hover:bg-slate-50"
+                          >
+                            {inactiveExpanded
+                              ? "Hide Inactive Beds"
+                              : "Show Inactive Beds"}
+                          </button>
+                        </div>
+
+                        {inactiveExpanded && (
+                          <div
+                            id={`inactive-beds-${room.id}`}
+                            className="mt-3 grid gap-3 md:grid-cols-2 xl:grid-cols-3"
+                          >
+                            {inactiveRoomBeds.map((bed) => (
+                              <BedCard key={bed.id} bed={bed} />
+                            ))}
+                          </div>
+                        )}
+                      </div>
+                    )}
                   </article>
                 );
               })
@@ -838,6 +1182,50 @@ export default function RoomsPage() {
         </section>
       </div>
     </main>
+  );
+}
+
+function BedCard({
+  bed,
+  canDelete = false,
+  onDelete,
+}: {
+  bed: Bed;
+  canDelete?: boolean;
+  onDelete?: () => void;
+}) {
+  return (
+    <div className="rounded-2xl border border-slate-200 bg-slate-50 p-4">
+      <div className="flex items-center justify-between gap-3">
+        <p className="font-bold text-slate-900">
+          {normalizeBedLabel(bed.bed_number)}
+        </p>
+        <span
+          className={`rounded-full px-3 py-1 text-xs font-bold ${bedStatusClass(
+            bed.status,
+          )}`}
+        >
+          {bed.status}
+        </span>
+      </div>
+
+      <p className="mt-3 text-xs text-slate-600">
+        Mattress: {bed.mattress_condition || "Not recorded"}
+      </p>
+      <p className="mt-1 text-xs text-slate-600">
+        Cover: {bed.mattress_cover || "Not recorded"}
+      </p>
+
+      {canDelete && onDelete && (
+        <button
+          type="button"
+          onClick={onDelete}
+          className="mt-3 text-xs font-semibold text-red-700"
+        >
+          Delete Bed
+        </button>
+      )}
+    </div>
   );
 }
 

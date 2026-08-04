@@ -20,10 +20,6 @@ export default function ComplaintsPage() {
   const [complaints, setComplaints] = useState<Complaint[]>([]);
   const [loading, setLoading] = useState(true);
 
-  useEffect(() => {
-    fetchComplaints();
-  }, []);
-
   async function fetchComplaints() {
     const { data, error } = await supabase
       .from("complaints")
@@ -48,6 +44,11 @@ export default function ComplaintsPage() {
 
     setLoading(false);
   }
+
+  useEffect(() => {
+    const timeoutId = window.setTimeout(() => void fetchComplaints(), 0);
+    return () => window.clearTimeout(timeoutId);
+  }, []);
 async function updateStatus(id: number, status: string) {
   const { error } = await supabase
     .from("complaints")
