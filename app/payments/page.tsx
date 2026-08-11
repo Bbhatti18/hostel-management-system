@@ -8,6 +8,7 @@ import {
   useMemo,
   useState,
 } from "react";
+import PaymentsNavigation from "@/components/payments/PaymentsNavigation";
 import { supabase } from "@/lib/supabase";
 import {
   getVerifiedPaymentTotal,
@@ -573,6 +574,8 @@ export default function PaymentsPage() {
             + Add Payment
           </button>
         </section>
+
+        <PaymentsNavigation active="payments" />
 
         {(message || error) && (
           <section

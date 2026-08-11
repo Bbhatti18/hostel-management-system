@@ -4,11 +4,10 @@ import Link from "next/link";
 import { useCallback, useEffect, useState } from "react";
 import { supabase } from "@/lib/supabase";
 import { resolveAuthenticatedResident } from "@/lib/residentPortalAuth";
+import { isNoticeVisibleToResident } from "@/lib/noticeVisibility";
 
 type Notice = { id: string; title: string; description: string; notice_type: string | null; target_audience: string | null; audience: string | null; resident_id: string | null; room_id: string | null; priority: string | null; status: string | null; publish_date: string | null; expiry_date: string | null; is_active: boolean | null; pinned: boolean | null };
 const text = (value: unknown) => value == null ? "" : String(value);
-const normalized = (value: unknown) => text(value).trim().toLowerCase();
-const today = () => new Date().toISOString().slice(0, 10);
 
 export default function ResidentNoticesPage() {
   const [notices, setNotices] = useState<Notice[]>([]); const [loading, setLoading] = useState(true); const [error, setError] = useState("");
@@ -21,17 +20,10 @@ export default function ResidentNoticesPage() {
       supabase.from("admissions").select("room_id,status").eq("resident_id", auth.resident.id).ilike("status", "Active").order("created_at", { ascending: false }).limit(1).maybeSingle(),
     ]);
     if (noticeResult.error || admissionResult.error) { setError("Your notices could not be loaded. Please refresh and try again."); setLoading(false); return; }
-    const roomId = text(admissionResult.data?.room_id); const currentDate = today();
-    const visible = ((noticeResult.data ?? []) as Notice[]).filter((notice) => {
-      if (normalized(notice.status) !== "published" || notice.is_active === false) return false;
-      if (notice.publish_date && notice.publish_date > currentDate) return false;
-      if (notice.expiry_date && notice.expiry_date < currentDate) return false;
-      const audience = normalized(notice.audience); const target = normalized(notice.target_audience);
-      if (audience === "all residents" || (target === "all" && !["specific resident", "specific room", "staff", "internal", "admin"].includes(audience))) return true;
-      if (audience === "specific resident") return notice.resident_id === auth.resident.id;
-      if (audience === "specific room") return Boolean(roomId) && notice.room_id === roomId;
-      return false;
-    });
+    const roomId = text(admissionResult.data?.room_id);
+    const visible = ((noticeResult.data ?? []) as Notice[]).filter((notice) =>
+      isNoticeVisibleToResident(notice, auth.resident.id, roomId),
+    );
     setNotices(visible); setLoading(false);
   }, []);
   useEffect(() => { const timeout = window.setTimeout(() => void load(), 0); return () => window.clearTimeout(timeout); }, [load]);

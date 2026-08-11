@@ -1,159 +1,158 @@
+"use client";
+
+import Link from "next/link";
+import { useCallback, useEffect, useMemo, useState } from "react";
+import AdminLogoutButton from "@/components/layout/AdminLogoutButton";
 import Sidebar from "@/components/layout/Sidebar";
+import { buildDashboardSummary, type DashboardData, type DashboardTask } from "@/lib/dashboardData";
+import { supabase } from "@/lib/supabase";
+import { getSupabaseErrorMessage } from "@/lib/supabaseErrors";
+
+const emptyData: DashboardData = {
+  residents: [], admissions: [], contracts: [], bills: [], payments: [],
+  receipts: [], maintenance: [], inspections: [], notices: [],
+};
+
+const quickActions = [
+  { icon: "👤", title: "Add Resident", description: "Register a new resident.", href: "/residents" },
+  { icon: "🛏️", title: "Assign Room", description: "Allocate room or bed.", href: "/admissions" },
+  { icon: "💳", title: "Generate Billing", description: "Generate monthly rent and electricity bills.", href: "/billing" },
+  { icon: "📄", title: "Contracts", description: "Manage resident contracts.", href: "/contracts" },
+];
+
+const taskTone: Record<DashboardTask["tone"], string> = {
+  red: "border-red-200 bg-red-50 text-red-800",
+  amber: "border-amber-200 bg-amber-50 text-amber-800",
+  blue: "border-blue-200 bg-blue-50 text-blue-800",
+  slate: "border-slate-200 bg-white text-slate-800",
+};
+
+const activityTone = {
+  blue: "border-blue-600",
+  green: "border-green-600",
+  purple: "border-purple-600",
+  orange: "border-orange-500",
+  slate: "border-slate-500",
+};
+
+function formatActivityDate(value: string) {
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return value;
+  return date.toLocaleString("en-PK", { dateStyle: "medium", timeStyle: "short" });
+}
 
 export default function DashboardPage() {
+  const [data, setData] = useState<DashboardData>(emptyData);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState("");
+  const [showAllActivity, setShowAllActivity] = useState(false);
+
+  const loadDashboardData = useCallback(async () => {
+    setLoading(true);
+    setError("");
+
+    const results = await Promise.all([
+      supabase.from("residents").select("id,full_name,resident_code,status,created_at,updated_at").order("created_at", { ascending: false }),
+      supabase.from("admissions").select("id,admission_number,resident_id,status,deposit_status,expected_leaving_date,created_at,updated_at").order("created_at", { ascending: false }),
+      supabase.from("contracts").select("id,contract_number,resident_id,admission_id,status,contract_status,resident_signature,resident_signature_url,resident_signature_status,signed_by_resident,signed_at,contract_content,terms,created_at,updated_at").order("created_at", { ascending: false }),
+      supabase.from("bills").select("id,bill_number,resident_id,rent_amount,total_amount,due_date,bill_status,created_at,updated_at").order("created_at", { ascending: false }),
+      supabase.from("payments").select("id,payment_number,bill_id,resident_id,amount,payment_status,verified_at,created_at,updated_at").order("created_at", { ascending: false }),
+      supabase.from("payment_receipts").select("id,resident_id,bill_id,status,verified_at,created_at,updated_at").order("created_at", { ascending: false }),
+      supabase.from("maintenance_requests").select("id,request_number,resident_id,title,priority,status,completed_at,created_at,updated_at").order("created_at", { ascending: false }),
+      supabase.from("room_inspections").select("id,inspection_number,resident_id,inspection_type,status,inspection_date,created_at,updated_at").order("created_at", { ascending: false }),
+      supabase.from("notices").select("id,notice_number,title,status,is_active,publish_date,expiry_date,created_at,updated_at").order("created_at", { ascending: false }),
+    ]);
+
+    const failed = results.find((result) => result.error)?.error;
+    if (failed) {
+      setError(getSupabaseErrorMessage(failed, "Dashboard data could not be loaded. Please refresh and try again."));
+    } else {
+      setData({
+        residents: results[0].data ?? [], admissions: results[1].data ?? [],
+        contracts: results[2].data ?? [], bills: results[3].data ?? [],
+        payments: results[4].data ?? [], receipts: results[5].data ?? [],
+        maintenance: results[6].data ?? [], inspections: results[7].data ?? [],
+        notices: results[8].data ?? [],
+      });
+    }
+
+    setLoading(false);
+  }, []);
+
+  useEffect(() => {
+    const timeout = window.setTimeout(() => void loadDashboardData(), 0);
+    return () => window.clearTimeout(timeout);
+  }, [loadDashboardData]);
+
+  const summary = useMemo(() => buildDashboardSummary(data), [data]);
+  const visibleActivities = showAllActivity
+    ? summary.activities
+    : summary.activities.slice(0, 3);
+
   return (
     <main className="min-h-screen bg-gray-100">
       <div className="flex">
-
         <Sidebar />
-
-        <section className="flex-1 p-10">
-
-          <header className="mb-8 flex items-center justify-between">
-
+        <section className="min-w-0 flex-1 p-6 sm:p-10">
+          <header className="mb-8 flex flex-wrap items-center justify-between gap-4">
             <div>
-
-              <h2 className="text-4xl font-bold">
-                Welcome Back 👋
-              </h2>
-
-              <p className="mt-2 text-gray-600">
-                StayHub Admin Dashboard
-              </p>
-
+              <h2 className="text-4xl font-bold">Welcome Back 👋</h2>
+              <p className="mt-2 text-gray-600">StayHub Admin Dashboard</p>
             </div>
-
             <div className="flex items-center gap-4">
-
-              <button className="rounded-xl border bg-white px-5 py-3 shadow hover:bg-gray-50">
-                🔔 Notifications
-              </button>
-
-              <div className="flex h-12 w-12 items-center justify-center rounded-full bg-blue-600 text-white font-bold">
-                A
-              </div>
-
+              <AdminLogoutButton />
+              <div className="flex h-12 w-12 items-center justify-center rounded-full bg-blue-600 font-bold text-white">A</div>
             </div>
-
           </header>
 
-          <h3 className="mb-6 text-2xl font-semibold text-gray-800">
-            Quick Actions
-          </h3>
+          {error && <div className="mb-6 rounded-xl border border-red-200 bg-red-50 px-4 py-3 text-sm font-medium text-red-700">{error}</div>}
 
+          <h3 className="mb-6 text-2xl font-semibold text-gray-800">Quick Actions</h3>
           <div className="grid gap-6 md:grid-cols-2 xl:grid-cols-4">
-
-            <div className="cursor-pointer rounded-2xl bg-white p-6 shadow-lg transition hover:-translate-y-1 hover:shadow-xl">
-              <div className="text-4xl">👤</div>
-              <h4 className="mt-4 text-xl font-bold">
-                Add Resident
-              </h4>
-              <p className="mt-2 text-sm text-gray-500">
-                Register a new resident.
-              </p>
-            </div>
-
-            <div className="cursor-pointer rounded-2xl bg-white p-6 shadow-lg transition hover:-translate-y-1 hover:shadow-xl">
-              <div className="text-4xl">🛏️</div>
-              <h4 className="mt-4 text-xl font-bold">
-                Assign Room
-              </h4>
-              <p className="mt-2 text-sm text-gray-500">
-                Allocate room or bed.
-              </p>
-            </div>
-
-            <div className="cursor-pointer rounded-2xl bg-white p-6 shadow-lg transition hover:-translate-y-1 hover:shadow-xl">
-              <div className="text-4xl">💳</div>
-              <h4 className="mt-4 text-xl font-bold">
-                Generate Billing
-              </h4>
-              <p className="mt-2 text-sm text-gray-500">
-                Generate monthly rent and electricity bills.
-              </p>
-            </div>
-
-            <div className="cursor-pointer rounded-2xl bg-white p-6 shadow-lg transition hover:-translate-y-1 hover:shadow-xl">
-              <div className="text-4xl">📄</div>
-              <h4 className="mt-4 text-xl font-bold">
-                Contracts
-              </h4>
-              <p className="mt-2 text-sm text-gray-500">
-                Manage resident contracts.
-              </p>
-            </div>
-
+            {quickActions.map((action) => (
+              <Link key={action.href} href={action.href} className="rounded-2xl bg-white p-6 shadow-lg transition hover:-translate-y-1 hover:shadow-xl focus:outline-none focus:ring-4 focus:ring-blue-200">
+                <div className="text-4xl" aria-hidden="true">{action.icon}</div>
+                <h4 className="mt-4 text-xl font-bold">{action.title}</h4>
+                <p className="mt-2 text-sm text-gray-500">{action.description}</p>
+              </Link>
+            ))}
           </div>
-          {/* Bottom Section */}
 
           <div className="mt-10 grid gap-6 lg:grid-cols-2">
-
-            {/* Today's Tasks */}
-
-            <div className="rounded-2xl bg-white p-6 shadow-lg">
-
-              <h3 className="text-xl font-bold">
-                Today&apos;s Tasks
-              </h3>
-
-              <div className="mt-5 space-y-4">
-
-                <div className="rounded-xl border p-4">
-                  📄 Contracts waiting for signatures
-                </div>
-
-                <div className="rounded-xl border p-4">
-                  💳 Generate monthly billing
-                </div>
-
-                <div className="rounded-xl border p-4">
-                  🚪 Upcoming resident check-outs
-                </div>
-
-                <div className="rounded-xl border p-4">
-                  🛠 Pending maintenance requests
-                </div>
-
+            <section className="rounded-2xl bg-white p-6 shadow-lg">
+              <h3 className="text-xl font-bold">Today&apos;s Tasks</h3>
+              <div className="mt-5 space-y-3">
+                {loading ? <p className="rounded-xl border border-slate-200 p-4 text-sm text-slate-500">Loading current tasks...</p> : summary.tasks.length === 0 ? <p className="rounded-xl border border-slate-200 p-4 text-sm text-slate-500">No urgent tasks right now.</p> : summary.tasks.map((item) => (
+                  <Link key={item.id} href={item.href} className={`flex items-center justify-between gap-4 rounded-xl border p-4 transition hover:brightness-95 ${taskTone[item.tone]}`}>
+                    <span className="font-medium">{item.count} {item.label}</span><span aria-hidden="true" className="text-lg">→</span>
+                  </Link>
+                ))}
               </div>
+            </section>
 
-            </div>
-
-            {/* Recent Activity */}
-
-            <div className="rounded-2xl bg-white p-6 shadow-lg">
-
-              <h3 className="text-xl font-bold">
-                Recent Activity
-              </h3>
-
+            <section className="rounded-2xl bg-white p-6 shadow-lg">
+              <h3 className="text-xl font-bold">Recent Activity</h3>
               <div className="mt-5 space-y-4">
-
-                <div className="border-l-4 border-blue-600 pl-4">
-                  Resident admission completed.
-                </div>
-
-                <div className="border-l-4 border-green-600 pl-4">
-                  Monthly payment received.
-                </div>
-
-                <div className="border-l-4 border-purple-600 pl-4">
-                  Contract uploaded.
-                </div>
-
-                <div className="border-l-4 border-orange-500 pl-4">
-                  Room inspection completed.
-                </div>
-
+                {loading ? <p className="text-sm text-slate-500">Loading recent activity...</p> : summary.activities.length === 0 ? <p className="text-sm text-slate-500">No recent activity is available.</p> : visibleActivities.map((activity) => (
+                  <Link key={activity.id} href={activity.href} className={`block border-l-4 pl-4 transition hover:bg-slate-50 ${activityTone[activity.tone]}`}>
+                    <p className="font-medium text-slate-800">{activity.description}</p>
+                    <p className="mt-1 text-xs text-slate-500">{formatActivityDate(activity.occurredAt)}</p>
+                  </Link>
+                ))}
               </div>
-
-            </div>
-
+              {!loading && summary.activities.length > 3 && (
+                <button
+                  type="button"
+                  onClick={() => setShowAllActivity((current) => !current)}
+                  className="mt-5 w-full rounded-xl border border-slate-200 bg-white px-4 py-3 text-sm font-semibold text-blue-700 transition hover:bg-slate-50"
+                >
+                  {showAllActivity ? "Show Less" : "View All Recent Activity"}
+                </button>
+              )}
+            </section>
           </div>
-
         </section>
-
       </div>
-
     </main>
   );
 }

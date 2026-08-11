@@ -6,12 +6,8 @@ import {
   useMemo,
   useState,
 } from "react";
+import PaymentsNavigation from "@/components/payments/PaymentsNavigation";
 import { supabase } from "@/lib/supabase";
-import {
-  getVerifiedPaymentTotal,
-  refreshBillFinancials,
-  roundMoney,
-} from "@/lib/financials";
 import { getSupabaseErrorMessage } from "@/lib/supabaseErrors";
 
 type GenericRow = Record<string, unknown>;
@@ -32,6 +28,7 @@ type PaymentReceipt = {
   verified_by: string | null;
   verified_at: string | null;
   notes: string | null;
+  remarks: string | null;
   payment_id?: string | null;
   created_at: string;
 };
@@ -98,10 +95,35 @@ function statusClass(status: ReceiptStatus) {
   return "bg-amber-100 text-amber-700";
 }
 
-function createPaymentNumber() {
-  return `PAY-${new Date().getFullYear()}-${Date.now()
-    .toString()
-    .slice(-8)}`;
+function receiptPaymentMethod(notes: string | null) {
+  const match = notes?.match(/^Payment method:\s*(.+)$/im);
+  return match?.[1]?.trim() || "Receipt submission";
+}
+
+function receiptNotes(receipt: PaymentReceipt) {
+  const submittedNotes = (receipt.notes ?? "")
+    .split("\n")
+    .filter((line) => !/^Payment method:/i.test(line.trim()))
+    .join(" ")
+    .trim();
+  return [
+    submittedNotes,
+    receipt.remarks ? `Review: ${receipt.remarks}` : "",
+  ]
+    .filter(Boolean)
+    .join(" | ") || "—";
+}
+
+async function getValidAccessToken() {
+  const {
+    data: { session },
+  } = await supabase.auth.getSession();
+  if (session?.access_token) return session.access_token;
+
+  const {
+    data: { session: refreshedSession },
+  } = await supabase.auth.refreshSession();
+  return refreshedSession?.access_token ?? null;
 }
 
 export default function PaymentVerificationPage() {
@@ -202,7 +224,7 @@ export default function PaymentVerificationPage() {
 
   async function updateReceiptStatus(
     receipt: PaymentReceipt,
-    nextStatus: ReceiptStatus
+    nextStatus: "Verified" | "Rejected"
   ) {
     const rejectionReason =
       nextStatus === "Rejected"
@@ -214,234 +236,53 @@ export default function PaymentVerificationPage() {
     setMessage("");
     setError("");
 
-    const { data: currentReceipt, error: receiptError } = await supabase
-      .from("payment_receipts")
-      .select("*")
-      .eq("id", receipt.id)
-      .single();
-
-    if (receiptError || !currentReceipt) {
-      setError("The receipt could not be re-checked. Refresh and try again.");
-      setUpdatingId(null);
-      return;
-    }
-
-    if (currentReceipt.status !== "Pending Verification") {
-      setError(`This receipt is already ${currentReceipt.status}. No second action was applied.`);
-      setUpdatingId(null);
-      await refresh();
-      return;
-    }
-
-    const { data: existingPayment, error: existingPaymentError } = await supabase
-      .from("payments")
-      .select("*")
-      .eq("receipt_id", receipt.id)
-      .maybeSingle();
-    if (existingPaymentError) {
-      setError("The linked payment could not be checked. Please try again.");
-      setUpdatingId(null);
-      return;
-    }
-
-    if (nextStatus === "Rejected") {
-      if (existingPayment?.payment_status === "Verified") {
-        setError("This receipt already has a verified payment. It cannot be rejected without first resolving that financial record.");
-        setUpdatingId(null);
-        return;
-      }
-
-      const { data: rejectedReceipt, error: rejectionError } = await supabase
-        .from("payment_receipts")
-        .update({
-          status: "Rejected",
-          verified: false,
-          verified_by: null,
-          verified_at: null,
-          notes: rejectionReason,
-          updated_at: new Date().toISOString(),
-        })
-        .eq("id", receipt.id)
-        .eq("status", "Pending Verification")
-        .select("id")
-        .maybeSingle();
-
-      if (rejectionError || !rejectedReceipt) {
-        setError("The receipt changed before it could be rejected. Refresh and review its current status.");
-      } else if (existingPayment && existingPayment.payment_status === "Pending") {
-        const { error: paymentRejectError } = await supabase
-          .from("payments")
-          .update({ payment_status: "Rejected", verified: false, notes: rejectionReason, updated_at: new Date().toISOString() })
-          .eq("id", existingPayment.id)
-          .eq("payment_status", "Pending");
-        if (paymentRejectError) {
-          setError("The receipt was rejected, but its pending payment record could not be updated. The payment remains unverified and does not reduce the bill balance.");
-        } else {
-          setMessage("Receipt rejected. No amount was applied to the bill.");
-        }
-      } else {
-        setMessage("Receipt rejected. No amount was applied to the bill.");
-      }
-
-      await refresh();
-      setUpdatingId(null);
-      return;
-    }
-
-    if (!currentReceipt.bill_id) {
-      setError("This receipt is not linked to a bill and cannot be verified.");
-      setUpdatingId(null);
-      return;
-    }
-
-    const { data: currentBill, error: billError } = await supabase
-      .from("bills")
-      .select("id, resident_id, total_amount, bill_status")
-      .eq("id", currentReceipt.bill_id)
-      .single();
-    if (
-      billError ||
-      !currentBill ||
-      text(currentBill.resident_id) !== text(currentReceipt.resident_id) ||
-      currentBill.bill_status === "Cancelled"
-    ) {
-      setError("The receipt is not linked to a valid, non-cancelled bill for this resident.");
-      setUpdatingId(null);
-      return;
-    }
-
-    const verifiedTotal = await getVerifiedPaymentTotal(currentReceipt.bill_id).catch(() => null);
-    const receiptAmount = roundMoney(Number(currentReceipt.amount ?? 0));
-    const outstanding =
-      verifiedTotal === null
-        ? null
-        : Math.max(roundMoney(Number(currentBill.total_amount ?? 0) - verifiedTotal), 0);
-    if (outstanding === null) {
-      setError("The current bill balance could not be confirmed. Please try again.");
-      setUpdatingId(null);
-      return;
-    }
-    if (receiptAmount <= 0 || receiptAmount > outstanding) {
-      setError(`The receipt amount must be positive and cannot exceed the outstanding balance of ${money(outstanding)}.`);
-      setUpdatingId(null);
-      return;
-    }
-
-    if (currentReceipt.reference_number) {
-      let referenceQuery = supabase
-        .from("payments")
-        .select("id")
-        .eq("reference_number", currentReceipt.reference_number)
-        .limit(1);
-      if (existingPayment?.id) {
-        referenceQuery = referenceQuery.neq("id", existingPayment.id);
-      }
-      const { data: duplicateReference, error: referenceError } = await referenceQuery;
-      if (referenceError) {
-        setError("The receipt reference could not be checked. Please try again.");
-        setUpdatingId(null);
-        return;
-      }
-      if ((duplicateReference ?? []).length > 0) {
-        setError("This reference number is already linked to another payment.");
-        setUpdatingId(null);
-        return;
-      }
-    }
-
-    let paymentId = text(existingPayment?.id);
-    if (!existingPayment) {
-      const { data: newPayment, error: paymentError } = await supabase
-        .from("payments")
-        .insert({
-          payment_number: createPaymentNumber(),
-          resident_id: currentReceipt.resident_id,
-          bill_id: currentReceipt.bill_id,
-          receipt_id: currentReceipt.id,
-          payment_date: new Date().toISOString().slice(0, 10),
-          payment_method: "Receipt submission",
-          reference_number: currentReceipt.reference_number,
-          amount: receiptAmount,
-          payment_status: "Pending",
-          verified: false,
-          notes: "Created from a resident receipt awaiting final verification.",
-        })
-        .select("id")
-        .single();
-      if (paymentError || !newPayment) {
-        setError(getSupabaseErrorMessage(paymentError, "The receipt was not changed because its payment record could not be prepared."));
-        setUpdatingId(null);
-        return;
-      }
-      paymentId = text(newPayment.id);
-    } else {
-      const paymentMatchesReceipt =
-        existingPayment.payment_status === "Pending" &&
-        text(existingPayment.bill_id) === text(currentReceipt.bill_id) &&
-        text(existingPayment.resident_id) === text(currentReceipt.resident_id) &&
-        roundMoney(Number(existingPayment.amount ?? 0)) === receiptAmount;
-      if (!paymentMatchesReceipt) {
-        setError("The linked payment no longer matches this receipt. Review the payment history before verifying.");
-        setUpdatingId(null);
-        return;
-      }
-    }
-
-    const { data: userData } = await supabase.auth.getUser();
-    const verifier = userData.user?.email ?? "Admin";
-    const verifiedAt = new Date().toISOString();
-    const { data: verifiedReceipt, error: verifyError } = await supabase
-      .from("payment_receipts")
-      .update({
-        status: "Verified",
-        verified: true,
-        verified_by: verifier,
-        verified_at: verifiedAt,
-        payment_id: paymentId,
-        updated_at: verifiedAt,
-      })
-      .eq("id", receipt.id)
-      .eq("status", "Pending Verification")
-      .select("id")
-      .maybeSingle();
-    if (verifyError || !verifiedReceipt) {
-      setError("The receipt changed before verification completed. Its prepared payment remains pending and does not affect the bill.");
-      setUpdatingId(null);
-      await refresh();
-      return;
-    }
-
-    const { data: verifiedPayment, error: paymentVerifyError } = await supabase
-      .from("payments")
-      .update({
-        payment_status: "Verified",
-        verified: true,
-        verified_by: verifier,
-        verified_at: verifiedAt,
-        updated_at: verifiedAt,
-      })
-      .eq("id", paymentId)
-      .eq("payment_status", "Pending")
-      .select("id")
-      .maybeSingle();
-    if (paymentVerifyError || !verifiedPayment) {
-      setError("The receipt was verified, but its payment could not be finalized. The pending payment does not reduce the bill balance; an administrator must retry or review it.");
-      setUpdatingId(null);
-      await refresh();
-      return;
-    }
-
     try {
-      await refreshBillFinancials(currentReceipt.bill_id);
-      setMessage("Receipt verified, payment recorded, and bill balance refreshed.");
-    } catch {
-      setError("The receipt and payment were verified, but the stored bill summary could not be refreshed. Verified-payment totals remain the source of truth.");
+      const accessToken = await getValidAccessToken();
+      if (!accessToken) {
+        throw new Error(
+          "Your admin session could not be verified. Please sign in again.",
+        );
+      }
+
+      const response = await fetch("/api/payment-verification", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${accessToken}`,
+        },
+        body: JSON.stringify({
+          receiptId: receipt.id,
+          action: nextStatus === "Verified" ? "Verify" : "Reject",
+          rejectionReason,
+        }),
+      });
+      const payload = (await response.json().catch(() => null)) as
+        | { message?: string; error?: string; notificationWarning?: boolean }
+        | null;
+      if (!response.ok) {
+        throw new Error(
+          payload?.error || "The receipt verification request failed.",
+        );
+      }
+
+      setMessage(
+        `${payload?.message || "Receipt status updated successfully."}${
+          payload?.notificationWarning
+            ? " The record was saved, but its notification could not be delivered."
+            : ""
+        }`,
+      );
+      await refresh();
+    } catch (updateError) {
+      setError(
+        updateError instanceof Error
+          ? updateError.message
+          : "The receipt verification request failed.",
+      );
+    } finally {
+      setUpdatingId(null);
     }
-
-    await refresh();
-    setUpdatingId(null);
   }
-
   return (
     <main className="min-h-screen bg-slate-50 p-4 sm:p-6 lg:p-8">
       <div className="mx-auto max-w-7xl space-y-6">
@@ -458,6 +299,8 @@ export default function PaymentVerificationPage() {
             Verify or reject resident payment receipts.
           </p>
         </section>
+
+        <PaymentsNavigation active="verification" />
 
         {(message || error) && (
           <section
@@ -518,8 +361,12 @@ export default function PaymentVerificationPage() {
                   {[
                     "Resident",
                     "Bill",
+                    "Billing Month",
                     "Amount",
+                    "Method",
                     "Reference",
+                    "Submitted",
+                    "Notes",
                     "Receipt",
                     "Status",
                     "Actions",
@@ -538,7 +385,7 @@ export default function PaymentVerificationPage() {
                 {loading ? (
                   <tr>
                     <td
-                      colSpan={7}
+                      colSpan={11}
                       className="px-5 py-12 text-center text-sm text-slate-500"
                     >
                       Loading receipts...
@@ -547,7 +394,7 @@ export default function PaymentVerificationPage() {
                 ) : filteredReceipts.length === 0 ? (
                   <tr>
                     <td
-                      colSpan={7}
+                      colSpan={11}
                       className="px-5 py-12 text-center text-sm text-slate-500"
                     >
                       No payment receipts found.
@@ -583,12 +430,28 @@ export default function PaymentVerificationPage() {
                           {firstText(bill, ["bill_number"]) || "No bill"}
                         </td>
 
+                        <td className="px-5 py-4 text-sm text-slate-700">
+                          {firstText(bill, ["billing_month"]) || "—"}
+                        </td>
+
                         <td className="px-5 py-4 text-sm font-semibold text-slate-900">
                           {money(receipt.amount)}
                         </td>
 
                         <td className="px-5 py-4 text-sm text-slate-700">
+                          {receiptPaymentMethod(receipt.notes)}
+                        </td>
+
+                        <td className="px-5 py-4 text-sm text-slate-700">
                           {receipt.reference_number || "—"}
+                        </td>
+
+                        <td className="px-5 py-4 text-sm text-slate-700">
+                          {new Date(receipt.created_at).toLocaleString("en-PK")}
+                        </td>
+
+                        <td className="max-w-xs px-5 py-4 text-sm text-slate-700">
+                          {receiptNotes(receipt)}
                         </td>
 
                         <td className="px-5 py-4">

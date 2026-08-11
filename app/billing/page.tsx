@@ -16,6 +16,10 @@ import {
   roundMoney,
 } from "@/lib/financials";
 import { getSupabaseErrorMessage } from "@/lib/supabaseErrors";
+import {
+  notificationWarning,
+  requestEventNotification,
+} from "@/lib/notifications/client";
 
 type GenericRow = Record<string, unknown>;
 
@@ -906,10 +910,15 @@ export default function BillingPage() {
           return;
         }
       }
+      const notificationResult = editingId
+        ? null
+        : await requestEventNotification("bill_generated", savedBillId);
       setMessage(
         editingId
           ? "Bill updated successfully."
-          : "Bill generated successfully."
+          : `Bill generated successfully.${
+              notificationResult ? notificationWarning(notificationResult) : ""
+            }`,
       );
       setEditingId(null);
       setEditingAcBillId(null);

@@ -10,6 +10,7 @@ import {
   useState,
 } from "react";
 import { supabase } from "@/lib/supabase";
+import { ensureResidentLogin, resetResidentPassword } from "@/lib/residentLogin";
 import {
   getSupabaseErrorMessage,
   isMissingColumnError,
@@ -195,6 +196,7 @@ export default function ResidentsPage() {
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
   const [archivingId, setArchivingId] = useState<string | null>(null);
+  const [resettingPasswordId, setResettingPasswordId] = useState<string | null>(null);
   const [message, setMessage] = useState("");
   const [error, setError] = useState("");
   const [showProfile, setShowProfile] = useState(false);
@@ -588,12 +590,20 @@ export default function ResidentsPage() {
     try {
       result = editingId
         ? await supabase.from("residents").update(payload).eq("id", editingId)
-        : await supabase.from("residents").insert(payload);
+        : await supabase
+            .from("residents")
+            .insert(payload)
+            .select("id, full_name, email")
+            .single();
 
       if (result.error && isMissingColumnError(result.error)) {
         result = editingId
           ? await supabase.from("residents").update(fallbackPayload).eq("id", editingId)
-          : await supabase.from("residents").insert(fallbackPayload);
+          : await supabase
+              .from("residents")
+              .insert(fallbackPayload)
+              .select("id, full_name, email")
+              .single();
       }
     } catch {
       setError("Unable to save resident. Please try again.");
@@ -613,10 +623,63 @@ export default function ResidentsPage() {
       return;
     }
 
-    setMessage(editingId ? "Resident updated successfully." : "Resident added successfully.");
+    let successMessage = editingId
+      ? "Resident updated successfully."
+      : "Resident added successfully.";
+
+    if (!editingId && result.data?.id) {
+      try {
+        const login = await ensureResidentLogin(String(result.data.id));
+        successMessage = login.created
+          ? `Resident added successfully. Portal login: ${login.email} | Temporary password: ${login.temporaryPassword}`
+          : `Resident added successfully. A portal login already exists for ${login.email}.`;
+      } catch (loginError) {
+        successMessage = `Resident added successfully, but the portal login could not be created automatically. ${
+          loginError instanceof Error ? loginError.message : "Please create the login later."
+        }`;
+      }
+    }
+
+    setMessage(successMessage);
     closeForm();
     await refresh();
     setSaving(false);
+  }
+
+  async function handleResetPortalPassword(resident: Resident) {
+    if (resident.status === "Archived") {
+      setError("Archived residents cannot receive a new portal password.");
+      return;
+    }
+
+    if (!resident.email?.trim()) {
+      setError("This resident does not have an email address.");
+      return;
+    }
+
+    const confirmed = window.confirm(
+      `Generate a new temporary portal password for ${resident.full_name}? The resident's previous password will stop working.`,
+    );
+    if (!confirmed) return;
+
+    setResettingPasswordId(resident.id);
+    setMessage("");
+    setError("");
+
+    try {
+      const result = await resetResidentPassword(resident.id);
+      setMessage(
+        `Portal password reset successfully. Email: ${result.email} | Temporary password: ${result.temporaryPassword}`,
+      );
+    } catch (resetError) {
+      setError(
+        resetError instanceof Error
+          ? resetError.message
+          : "Unable to reset the resident portal password.",
+      );
+    } finally {
+      setResettingPasswordId(null);
+    }
   }
 
   async function archiveResident(resident: Resident) {
@@ -628,6 +691,27 @@ export default function ResidentsPage() {
     setArchivingId(resident.id);
     setMessage("");
     setError("");
+
+    const { data: currentAdmission, error: admissionError } = await supabase
+      .from("admissions")
+      .select("id")
+      .eq("resident_id", resident.id)
+      .in("status", ["Pending", "Active"])
+      .limit(1)
+      .maybeSingle();
+
+    if (admissionError || currentAdmission) {
+      setError(
+        admissionError
+          ? getSupabaseErrorMessage(
+              admissionError,
+              "Unable to verify this resident's current admission.",
+            )
+          : "Complete, cancel, or archive the resident's current admission before archiving the resident.",
+      );
+      setArchivingId(null);
+      return;
+    }
 
     const { error: archiveError } = await supabase
       .from("residents")
@@ -865,6 +949,16 @@ export default function ResidentsPage() {
                           {resident.status !== "Archived" && (
                             <>
                               <button type="button" onClick={() => openEditForm(resident)} className="rounded-lg border border-slate-200 px-3 py-2 text-xs font-semibold text-slate-700">Edit</button>
+                              <button
+                                type="button"
+                                disabled={resettingPasswordId === resident.id}
+                                onClick={() => void handleResetPortalPassword(resident)}
+                                className="rounded-lg border border-emerald-200 px-3 py-2 text-xs font-semibold text-emerald-700 disabled:opacity-50"
+                              >
+                                {resettingPasswordId === resident.id
+                                  ? "Resetting..."
+                                  : "Reset Portal Password"}
+                              </button>
                               <button type="button" disabled={archivingId === resident.id} onClick={() => void archiveResident(resident)} className="rounded-lg border border-amber-200 px-3 py-2 text-xs font-semibold text-amber-700 disabled:opacity-50">{archivingId === resident.id ? "Archiving..." : "Archive"}</button>
                             </>
                           )}

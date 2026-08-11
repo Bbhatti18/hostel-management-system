@@ -8,6 +8,11 @@ import {
   useState,
 } from "react";
 import { supabase } from "@/lib/supabase";
+import { ensureResidentLogin } from "@/lib/residentLogin";
+import {
+  notificationWarning,
+  requestEventNotification,
+} from "@/lib/notifications/client";
 import { getSupabaseErrorMessage } from "@/lib/supabaseErrors";
 import {
   compareBedRecordsAscending,
@@ -103,6 +108,7 @@ export default function AdmissionForm({
   const [securityDeposit, setSecurityDeposit] = useState("");
   const [depositStatus, setDepositStatus] =
     useState<DepositStatus>("Pending");
+  const [specialClauses, setSpecialClauses] = useState("");
   const [residents, setResidents] = useState<Resident[]>([]);
   const [rooms, setRooms] = useState<Room[]>([]);
   const [beds, setBeds] = useState<Bed[]>([]);
@@ -307,6 +313,18 @@ export default function AdmissionForm({
         );
       }
 
+      let loginMessage = "";
+      try {
+        const login = await ensureResidentLogin(String(newResident.id));
+        loginMessage = login.created
+          ? ` Portal login: ${login.email} | Temporary password: ${login.temporaryPassword}`
+          : ` A portal login already exists for ${login.email}.`;
+      } catch (loginError) {
+        loginMessage = ` Portal login was not created automatically. ${
+          loginError instanceof Error ? loginError.message : "Please create it later."
+        }`;
+      }
+
       const refreshedResidents = await loadResidents();
       if (!refreshedResidents.some((resident) => resident.id === newResident.id)) {
         setResidents((current) => [...current, newResident as Resident]);
@@ -314,7 +332,7 @@ export default function AdmissionForm({
       setResidentId(String(newResident.id));
       setResidentForm(emptyResidentForm);
       setShowResidentModal(false);
-      setMessage(`${newResident.full_name} was added and selected.`);
+      setMessage(`${newResident.full_name} was added and selected.${loginMessage}`);
     } catch (saveError) {
       setResidentError(
         saveError instanceof Error
@@ -409,6 +427,55 @@ export default function AdmissionForm({
         throw new Error("This resident already has a current admission.");
       }
 
+      const { data: templates, error: templateError } = await supabase
+        .from("contract_templates")
+        .select("id, content")
+        .eq("is_active", true)
+        .order("id", { ascending: false });
+
+      if (templateError) {
+        throw new Error(
+          getSupabaseErrorMessage(
+            templateError,
+            "Unable to verify the active contract template. The admission was not created.",
+          ),
+        );
+      }
+
+      if ((templates ?? []).length === 0) {
+        throw new Error(
+          "No active contract template is available. Activate one standard contract template before creating an admission.",
+        );
+      }
+
+      if ((templates ?? []).length > 1) {
+        throw new Error(
+          "Multiple active contract templates are available. Keep exactly one standard template active before creating an admission.",
+        );
+      }
+
+      const template = templates![0];
+      const standardTerms = (template.content ?? "").trim();
+
+      if (!standardTerms) {
+        throw new Error(
+          "The active contract template has no terms. Complete the standard template before creating an admission.",
+        );
+      }
+
+      let portalLogin;
+      try {
+        portalLogin = await ensureResidentLogin(residentId);
+      } catch (loginError) {
+        throw new Error(
+          `Portal access could not be prepared, so the admission was not created. ${
+            loginError instanceof Error
+              ? loginError.message
+              : "Please try again."
+          }`,
+        );
+      }
+
       const { data: claimedBed, error: claimError } = await supabase
         .from("beds")
         .update({ status: BED_STATUS.OCCUPIED })
@@ -450,12 +517,14 @@ export default function AdmissionForm({
         .single();
 
       if (admissionError) {
-        const { error: rollbackError } = await supabase
+        const { data: releasedBed, error: rollbackError } = await supabase
           .from("beds")
           .update({ status: BED_STATUS.VACANT })
           .eq("id", bedId)
-          .eq("status", BED_STATUS.OCCUPIED);
-        if (rollbackError) {
+          .eq("status", BED_STATUS.OCCUPIED)
+          .select("id")
+          .maybeSingle();
+        if (rollbackError || !releasedBed) {
           throw new Error(
             "Admission was not saved, and the bed could not be released automatically. Please contact an administrator.",
           );
@@ -468,77 +537,82 @@ export default function AdmissionForm({
         );
       }
 
-      const { data: templates, error: templateError } = await supabase
-        .from("contract_templates")
-        .select("id, content")
-        .eq("is_active", true)
-        .order("id", { ascending: false });
+      const now = new Date().toISOString();
+      const cleanSpecialClauses = specialClauses.trim();
+      const termsSnapshot = `${standardTerms}${
+        cleanSpecialClauses
+          ? `\n\nSpecial Clauses:\n${cleanSpecialClauses}`
+          : ""
+      }`;
 
-      let contractPrepared = false;
-      let contractPreparationMessage = "";
-      if (templateError) {
-        console.error("[admission-contract] active template lookup failed", {
-          code: templateError.code,
-          message: templateError.message,
-          details: templateError.details,
-          hint: templateError.hint,
-        });
-        contractPreparationMessage =
-          "The active contract template could not be verified. Prepare the contract from Contracts.";
-      } else if ((templates ?? []).length === 0) {
-        contractPreparationMessage =
-          "No active contract template is available. Please activate the standard contract template first.";
-      } else if ((templates ?? []).length > 1) {
-        contractPreparationMessage =
-          "Multiple active contract templates are available. Keep one standard template active or select the required template from Contracts.";
-      } else if (!(templates?.[0]?.content ?? "").trim()) {
-        contractPreparationMessage =
-          "The active contract template has no terms. Complete the standard template before preparing this contract.";
-      }
+      const { error: contractError } = await supabase.from("contracts").insert({
+        contract_number: createContractNumber(),
+        resident_id: residentId,
+        admission_id: admissionData.id,
+        room_id: roomId,
+        bed_id: bedId,
+        template_id: template.id,
+        contract_content: termsSnapshot,
+        terms: termsSnapshot,
+        start_date: admissionDate,
+        end_date: null,
+        monthly_rent: Number(monthlyRent),
+        security_deposit: Number(securityDeposit || 0),
+        notice_period_days: 30,
+        status: "Pending Signature",
+        contract_status: "Pending Signature",
+        resident_signature_status: "Pending",
+        owner_signature_status: "Pending",
+        signed_by_resident: false,
+        signed_at: null,
+        notes: cleanSpecialClauses || null,
+        created_at: now,
+        updated_at: now,
+      });
 
-      const template = (templates ?? []).length === 1 ? templates![0] : null;
-      if (template?.content?.trim() && admissionData) {
-        const now = new Date().toISOString();
-        const termsSnapshot = template.content.trim();
-        const { error: contractError } = await supabase.from("contracts").insert({
-          contract_number: createContractNumber(),
-          resident_id: residentId,
-          admission_id: admissionData.id,
-          room_id: roomId,
-          bed_id: bedId,
-          template_id: template.id,
-          contract_content: termsSnapshot,
-          terms: termsSnapshot,
-          start_date: admissionDate,
-          end_date: null,
-          monthly_rent: Number(monthlyRent),
-          security_deposit: Number(securityDeposit || 0),
-          notice_period_days: 30,
-          status: "Pending Signature",
-          contract_status: "Pending Signature",
-          resident_signature_status: "Pending",
-          owner_signature_status: "Pending",
-          signed_by_resident: false,
-          signed_at: null,
-          created_at: now,
-          updated_at: now,
-        });
-        if (contractError) {
-          console.error("[admission-contract] contract insert failed", {
-            code: contractError.code,
-            message: contractError.message,
-            details: contractError.details,
-            hint: contractError.hint,
-          });
-          contractPreparationMessage = getSupabaseErrorMessage(
-            contractError,
-            "The admission was saved, but its contract could not be prepared. Prepare it from Contracts.",
-            "A non-cancelled contract already exists for this admission.",
+      if (contractError) {
+        const { data: rolledBackAdmission, error: admissionRollbackError } =
+          await supabase
+          .from("admissions")
+          .delete()
+          .eq("id", admissionData.id)
+          .eq("status", "Pending")
+          .select("id")
+          .maybeSingle();
+
+        if (admissionRollbackError || !rolledBackAdmission) {
+          throw new Error(
+            "The contract could not be prepared and the admission could not be rolled back. Its occupied bed was preserved; please review this admission before trying again.",
           );
-        } else {
-          contractPrepared = true;
         }
+
+        const { data: releasedBed, error: bedRollbackError } = await supabase
+          .from("beds")
+          .update({ status: BED_STATUS.VACANT })
+          .eq("id", bedId)
+          .eq("status", BED_STATUS.OCCUPIED)
+          .select("id")
+          .maybeSingle();
+
+        if (bedRollbackError || !releasedBed) {
+          throw new Error(
+            "The contract could not be prepared. The admission was rolled back, but its bed could not be released automatically. Please review the bed allocation before trying again.",
+          );
+        }
+
+        throw new Error(
+          getSupabaseErrorMessage(
+            contractError,
+            "The contract could not be prepared, so the admission was rolled back. Please try again.",
+            "A non-cancelled contract already exists for this admission.",
+          ),
+        );
       }
+
+      const notificationResult = await requestEventNotification(
+        "admission_created",
+        admissionData.id,
+      );
 
       setResidentId("");
       setRoomId("");
@@ -547,10 +621,13 @@ export default function AdmissionForm({
       setMonthlyRent("");
       setSecurityDeposit("");
       setDepositStatus("Pending");
+      setSpecialClauses("");
       setMessage(
-        contractPrepared
-          ? "Admission saved as Pending and its contract was prepared for resident signature."
-          : `Admission saved as Pending. ${contractPreparationMessage || "Its contract could not be prepared. Prepare it from Contracts."}`,
+        `Admission saved as Pending and its contract was prepared for resident signature.${
+          portalLogin.created && portalLogin.temporaryPassword
+            ? ` Portal login: ${portalLogin.email} | Temporary password: ${portalLogin.temporaryPassword}`
+            : ` Portal access is ready for ${portalLogin.email}.`
+        }${notificationWarning(notificationResult)}`,
       );
       await Promise.all([loadRoomsAndBeds(), onSaved()]);
     } catch (saveError) {
@@ -705,6 +782,24 @@ export default function AdmissionForm({
                 <option value="Pending">Pending</option>
                 <option value="Received">Received</option>
               </select>
+            </label>
+
+            <label className="md:col-span-2 xl:col-span-4">
+              <span className="mb-2 block text-sm font-semibold text-slate-700">
+                Special Contract Clauses (Optional)
+              </span>
+              <textarea
+                rows={4}
+                value={specialClauses}
+                onChange={(event) => setSpecialClauses(event.target.value)}
+                className={inputClass}
+                disabled={loading || saving}
+                placeholder="Leave blank to apply only the standard active contract template. Add resident-specific clauses here when required."
+              />
+              <span className="mt-2 block text-xs text-slate-500">
+                These clauses will be appended to the saved standard template
+                and preserved in this resident&apos;s contract snapshot.
+              </span>
             </label>
           </div>
 

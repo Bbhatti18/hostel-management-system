@@ -5,7 +5,8 @@ import { supabase } from "@/lib/supabase";
 import { getSupabaseErrorMessage } from "@/lib/supabaseErrors";
 
 type ContractTemplate = {
-  id: number;
+  id: string;
+  template_name: string;
   title: string;
   content: string;
   is_active: boolean;
@@ -17,7 +18,7 @@ export default function ContractTemplatePage() {
   const [title, setTitle] = useState("");
   const [content, setContent] = useState("");
   const [isActive, setIsActive] = useState(true);
-  const [editingId, setEditingId] = useState<number | null>(null);
+  const [editingId, setEditingId] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
   const [message, setMessage] = useState("");
@@ -29,8 +30,8 @@ export default function ContractTemplatePage() {
 
     const { data, error: loadError } = await supabase
       .from("contract_templates")
-      .select("id, title, content, is_active, created_at")
-      .order("id", { ascending: false });
+      .select("id, template_name, title, content, is_active, created_at")
+      .order("created_at", { ascending: false });
 
     if (loadError) {
       setTemplates([]);
@@ -75,21 +76,27 @@ export default function ContractTemplatePage() {
     setMessage("");
     setError("");
 
-    if (!title.trim()) {
+    const cleanTitle = title.trim();
+    const cleanContent = content.trim();
+
+    if (!cleanTitle) {
       setError("Please enter a template title.");
       return;
     }
 
-    if (!content.trim()) {
+    if (!cleanContent) {
       setError("Please enter contract rules and conditions.");
       return;
     }
 
     setSaving(true);
+
     const payload = {
-      title: title.trim(),
-      content: content.trim(),
+      template_name: cleanTitle,
+      title: cleanTitle,
+      content: cleanContent,
       is_active: isActive,
+      updated_at: new Date().toISOString(),
     };
 
     const result = editingId
@@ -119,7 +126,10 @@ export default function ContractTemplatePage() {
     if (isActive) {
       const { error: deactivateError } = await supabase
         .from("contract_templates")
-        .update({ is_active: false })
+        .update({
+          is_active: false,
+          updated_at: new Date().toISOString(),
+        })
         .neq("id", result.data.id);
 
       if (deactivateError) {
@@ -142,14 +152,18 @@ export default function ContractTemplatePage() {
     setSaving(false);
   }
 
-  async function activateTemplate(id: number) {
+  async function activateTemplate(id: string) {
     if (!window.confirm("Make this the active contract template?")) return;
+
     setMessage("");
     setError("");
 
     const { error: activateError } = await supabase
       .from("contract_templates")
-      .update({ is_active: true })
+      .update({
+        is_active: true,
+        updated_at: new Date().toISOString(),
+      })
       .eq("id", id);
 
     if (activateError) {
@@ -164,7 +178,10 @@ export default function ContractTemplatePage() {
 
     const { error: deactivateError } = await supabase
       .from("contract_templates")
-      .update({ is_active: false })
+      .update({
+        is_active: false,
+        updated_at: new Date().toISOString(),
+      })
       .neq("id", id);
 
     if (deactivateError) {
@@ -181,12 +198,16 @@ export default function ContractTemplatePage() {
 
   async function deactivateTemplate(template: ContractTemplate) {
     if (!window.confirm(`Make template ${template.title} inactive?`)) return;
+
     setMessage("");
     setError("");
 
     const { error: deactivateError } = await supabase
       .from("contract_templates")
-      .update({ is_active: false })
+      .update({
+        is_active: false,
+        updated_at: new Date().toISOString(),
+      })
       .eq("id", template.id);
 
     if (deactivateError) {
@@ -206,42 +227,104 @@ export default function ContractTemplatePage() {
   return (
     <div className="mx-auto max-w-7xl p-6">
       <div className="mb-6">
-        <p className="text-sm font-semibold uppercase tracking-[0.2em] text-indigo-600">StayHub</p>
+        <p className="text-sm font-semibold uppercase tracking-[0.2em] text-indigo-600">
+          StayHub
+        </p>
         <h1 className="mt-2 text-3xl font-bold">Contract Templates</h1>
-        <p className="mt-1 text-gray-600">Create and manage hostel contract templates.</p>
+        <p className="mt-1 text-gray-600">
+          Create and manage hostel contract templates.
+        </p>
       </div>
 
       {(message || error) && (
-        <div className={`mb-4 rounded-lg border p-4 ${error ? "border-red-200 bg-red-50 text-red-700" : "border-green-200 bg-green-50 text-green-700"}`}>
+        <div
+          className={`mb-4 rounded-lg border p-4 ${
+            error
+              ? "border-red-200 bg-red-50 text-red-700"
+              : "border-green-200 bg-green-50 text-green-700"
+          }`}
+        >
           {error || message}
         </div>
       )}
 
       <div className="grid grid-cols-1 gap-6 lg:grid-cols-2">
         <div className="rounded-lg border bg-white p-6">
-          <h2 className="mb-4 text-xl font-semibold">{editingId ? "Edit Template" : "New Template"}</h2>
+          <h2 className="mb-4 text-xl font-semibold">
+            {editingId ? "Edit Template" : "New Template"}
+          </h2>
+
           <form onSubmit={handleSubmit} className="space-y-4">
             <label className="block">
-              <span className="mb-2 block text-sm font-medium text-gray-700">Template Title *</span>
-              <input type="text" value={title} onChange={(event) => setTitle(event.target.value)} placeholder="Hostel Contract Rules" required disabled={saving} className="w-full rounded-lg border border-gray-300 px-3 py-2" />
+              <span className="mb-2 block text-sm font-medium text-gray-700">
+                Template Title *
+              </span>
+              <input
+                type="text"
+                value={title}
+                onChange={(event) => setTitle(event.target.value)}
+                placeholder="Hostel Contract Rules"
+                required
+                disabled={saving}
+                className="w-full rounded-lg border border-gray-300 px-3 py-2"
+              />
             </label>
+
             <label className="block">
-              <span className="mb-2 block text-sm font-medium text-gray-700">Contract Rules and Conditions *</span>
-              <textarea value={content} onChange={(event) => setContent(event.target.value)} rows={12} placeholder="Write the complete hostel contract here..." required disabled={saving} className="w-full rounded-lg border border-gray-300 px-3 py-2" />
+              <span className="mb-2 block text-sm font-medium text-gray-700">
+                Contract Rules and Conditions *
+              </span>
+              <textarea
+                value={content}
+                onChange={(event) => setContent(event.target.value)}
+                rows={12}
+                placeholder="Write the complete hostel contract here..."
+                required
+                disabled={saving}
+                className="w-full rounded-lg border border-gray-300 px-3 py-2"
+              />
             </label>
+
             <label className="flex items-center gap-3 text-sm text-gray-700">
-              <input type="checkbox" checked={isActive} onChange={(event) => setIsActive(event.target.checked)} disabled={saving} />
+              <input
+                type="checkbox"
+                checked={isActive}
+                onChange={(event) => setIsActive(event.target.checked)}
+                disabled={saving}
+              />
               Active template
             </label>
+
             <div className="flex gap-3">
-              <button type="submit" disabled={saving} className="rounded-lg bg-blue-600 px-5 py-2 text-white disabled:opacity-50">{saving ? "Saving..." : editingId ? "Update Template" : "Save Template"}</button>
-              {editingId && <button type="button" onClick={resetForm} disabled={saving} className="rounded-lg border border-gray-300 px-5 py-2">Cancel</button>}
+              <button
+                type="submit"
+                disabled={saving}
+                className="rounded-lg bg-blue-600 px-5 py-2 text-white disabled:opacity-50"
+              >
+                {saving
+                  ? "Saving..."
+                  : editingId
+                    ? "Update Template"
+                    : "Save Template"}
+              </button>
+
+              {editingId && (
+                <button
+                  type="button"
+                  onClick={resetForm}
+                  disabled={saving}
+                  className="rounded-lg border border-gray-300 px-5 py-2"
+                >
+                  Cancel
+                </button>
+              )}
             </div>
           </form>
         </div>
 
         <div className="rounded-lg border bg-white p-6">
           <h2 className="mb-4 text-xl font-semibold">Existing Templates</h2>
+
           {loading ? (
             <p className="text-gray-500">Loading templates...</p>
           ) : templates.length === 0 ? (
@@ -249,20 +332,56 @@ export default function ContractTemplatePage() {
           ) : (
             <div className="space-y-3">
               {templates.map((template) => (
-                <div key={template.id} className="rounded-lg border border-gray-200 p-4">
+                <div
+                  key={template.id}
+                  className="rounded-lg border border-gray-200 p-4"
+                >
                   <div className="flex items-start justify-between gap-3">
                     <div>
-                      <h3 className="font-semibold text-gray-800">{template.title}</h3>
-                      <p className="mt-2 whitespace-pre-wrap text-sm text-gray-600">{template.content}</p>
+                      <h3 className="font-semibold text-gray-800">
+                        {template.title}
+                      </h3>
+                      <p className="mt-2 whitespace-pre-wrap text-sm text-gray-600">
+                        {template.content}
+                      </p>
                     </div>
-                    <span className={template.is_active ? "rounded-full bg-green-100 px-3 py-1 text-xs font-medium text-green-700" : "rounded-full bg-gray-100 px-3 py-1 text-xs font-medium text-gray-600"}>{template.is_active ? "Active" : "Inactive"}</span>
+
+                    <span
+                      className={
+                        template.is_active
+                          ? "rounded-full bg-green-100 px-3 py-1 text-xs font-medium text-green-700"
+                          : "rounded-full bg-gray-100 px-3 py-1 text-xs font-medium text-gray-600"
+                      }
+                    >
+                      {template.is_active ? "Active" : "Inactive"}
+                    </span>
                   </div>
+
                   <div className="mt-4 flex flex-wrap gap-2">
-                    <button type="button" onClick={() => startEditing(template)} className="rounded bg-blue-600 px-3 py-1 text-sm text-white">Edit</button>
+                    <button
+                      type="button"
+                      onClick={() => startEditing(template)}
+                      className="rounded bg-blue-600 px-3 py-1 text-sm text-white"
+                    >
+                      Edit
+                    </button>
+
                     {!template.is_active ? (
-                      <button type="button" onClick={() => void activateTemplate(template.id)} className="rounded bg-green-600 px-3 py-1 text-sm text-white">Make Active</button>
+                      <button
+                        type="button"
+                        onClick={() => void activateTemplate(template.id)}
+                        className="rounded bg-green-600 px-3 py-1 text-sm text-white"
+                      >
+                        Make Active
+                      </button>
                     ) : (
-                      <button type="button" onClick={() => void deactivateTemplate(template)} className="rounded bg-amber-600 px-3 py-1 text-sm text-white">Make Inactive</button>
+                      <button
+                        type="button"
+                        onClick={() => void deactivateTemplate(template)}
+                        className="rounded bg-amber-600 px-3 py-1 text-sm text-white"
+                      >
+                        Make Inactive
+                      </button>
                     )}
                   </div>
                 </div>

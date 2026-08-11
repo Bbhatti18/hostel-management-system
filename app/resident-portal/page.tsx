@@ -3,6 +3,7 @@
 import { useCallback, useEffect, useMemo, useState, type ReactNode } from "react";
 import { useRouter } from "next/navigation";
 import Link from "next/link";
+import ResidentNoticePopup from "@/components/notices/ResidentNoticePopup";
 import { supabase } from "@/lib/supabase";
 import { normalizeBedLabel } from "@/lib/bedLabels";
 import {
@@ -10,8 +11,14 @@ import {
   isDepositVerified,
 } from "@/lib/contractWorkflow";
 import { resolveAuthenticatedResident } from "@/lib/residentPortalAuth";
+import { loadResidentPortalData } from "@/lib/residentPortalData";
+import {
+  isNoticeVisibleToResident,
+  type NoticeVisibilityRecord,
+} from "@/lib/noticeVisibility";
 
 type GenericRow = Record<string, unknown>;
+type PortalNotice = GenericRow & NoticeVisibilityRecord;
 
 type PortalTab =
   | "Overview"
@@ -88,7 +95,7 @@ export default function ResidentPortalPage() {
   const [contract, setContract] = useState<GenericRow | null>(null);
   const [bills, setBills] = useState<GenericRow[]>([]);
   const [payments, setPayments] = useState<GenericRow[]>([]);
-  const [notices, setNotices] = useState<GenericRow[]>([]);
+  const [notices, setNotices] = useState<PortalNotice[]>([]);
   const [inspections, setInspections] = useState<GenericRow[]>([]);
   const [maintenance, setMaintenance] = useState<GenericRow[]>([]);
   const [activeTab, setActiveTab] = useState<PortalTab>("Overview");
@@ -96,60 +103,29 @@ export default function ResidentPortalPage() {
   const [message, setMessage] = useState("");
   const [error, setError] = useState("");
 
-  const loadPortalData = useCallback(async (residentId: string, residentRow?: GenericRow) => {
+  const loadPortalData = useCallback(async (residentId: string) => {
     setLoading(true);
     setError("");
 
-    const residentResult = residentRow
-      ? { data: residentRow, error: null }
-      : await supabase
-          .from("residents")
-          .select("*")
-          .eq("id", residentId)
-          .maybeSingle();
-
-    if (residentResult.error || !residentResult.data) {
-      setError(residentResult.error?.message || "Resident record not found.");
+    const portalResult = await loadResidentPortalData();
+    if (!portalResult.data) {
+      setError(portalResult.error);
       setLoading(false);
       return;
     }
 
-    const residentPayload = residentResult.data as GenericRow;
+    const protectedData = portalResult.data;
+    if (protectedData.resident.id !== residentId) {
+      setError("Your resident account could not be verified.");
+      setLoading(false);
+      return;
+    }
 
     const [
-      admissionResult,
-      contractResult,
-      billsResult,
-      paymentsResult,
       noticesResult,
       inspectionsResult,
       maintenanceResult,
     ] = await Promise.all([
-      supabase
-        .from("admissions")
-        .select("*")
-        .eq("resident_id", residentId)
-        .in("status", ["Pending", "Active"])
-        .order("created_at", { ascending: false })
-        .limit(1)
-        .maybeSingle(),
-      supabase
-        .from("contracts")
-        .select("*")
-        .eq("resident_id", residentId)
-        .order("created_at", { ascending: false })
-        .limit(1)
-        .maybeSingle(),
-      supabase
-        .from("bills")
-        .select("*")
-        .eq("resident_id", residentId)
-        .order("billing_month", { ascending: false }),
-      supabase
-        .from("payments")
-        .select("*")
-        .eq("resident_id", residentId)
-        .order("created_at", { ascending: false }),
       supabase
         .from("notices")
         .select("*")
@@ -168,60 +144,21 @@ export default function ResidentPortalPage() {
         .order("created_at", { ascending: false }),
     ]);
 
-    const activeAdmission = (admissionResult.data ?? null) as GenericRow | null;
+    const activeAdmission = protectedData.admission;
 
-    let roomRow: GenericRow | null = null;
-    let bedRow: GenericRow | null = null;
-
-    const roomId = firstText(activeAdmission, ["room_id"]);
-    const bedId = firstText(activeAdmission, ["bed_id"]);
-
-    if (roomId) {
-      const roomResult = await supabase
-        .from("rooms")
-        .select("*")
-        .eq("id", roomId)
-        .maybeSingle();
-
-      roomRow = (roomResult.data ?? null) as GenericRow | null;
-    }
-
-    if (bedId) {
-      const bedResult = await supabase
-        .from("beds")
-        .select("*")
-        .eq("id", bedId)
-        .maybeSingle();
-
-      bedRow = (bedResult.data ?? null) as GenericRow | null;
-    }
-
-    const currentDate = new Date().toISOString().slice(0, 10);
     const currentRoomId = firstText(activeAdmission, ["room_id"]);
-    const filteredNotices = ((noticesResult.data ?? []) as GenericRow[])
-      .filter((notice) => {
-        const audience = firstText(notice, ["audience"]);
-        const target = firstText(notice, ["target_audience"]);
-        if (["Staff", "Internal", "Admin"].includes(audience)) return false;
-        if (audience === "All Residents" || (target === "All" && !audience)) return true;
-        if (audience === "Specific Resident") return firstText(notice, ["resident_id"]) === residentId;
-        if (audience === "Specific Room") return Boolean(currentRoomId) && firstText(notice, ["room_id"]) === currentRoomId;
-        return false;
-      })
-      .filter((notice) => {
-        const status = firstText(notice, ["status"]);
-        const publishDate = firstText(notice, ["publish_date"]);
-        const expiryDate = firstText(notice, ["expiry_date"]);
-        return status === "Published" && notice.is_active !== false && (!publishDate || publishDate <= currentDate) && (!expiryDate || expiryDate >= currentDate);
-      });
+    const filteredNotices = ((noticesResult.data ?? []) as PortalNotice[]).filter(
+      (notice) =>
+        isNoticeVisibleToResident(notice, residentId, currentRoomId),
+    );
 
-    setResident(residentPayload);
+    setResident(protectedData.resident);
     setAdmission(activeAdmission);
-    setRoom(roomRow);
-    setBed(bedRow);
-    setContract((contractResult.data ?? null) as GenericRow | null);
-    setBills((billsResult.data ?? []) as GenericRow[]);
-    setPayments((paymentsResult.data ?? []) as GenericRow[]);
+    setRoom(protectedData.room);
+    setBed(protectedData.bed);
+    setContract(protectedData.contract);
+    setBills(protectedData.bills);
+    setPayments(protectedData.payments);
     setNotices(filteredNotices);
     setInspections((inspectionsResult.data ?? []) as GenericRow[]);
     setMaintenance((maintenanceResult.data ?? []) as GenericRow[]);
@@ -390,6 +327,7 @@ export default function ResidentPortalPage() {
 
   return (
     <main className="min-h-screen bg-slate-50">
+      <ResidentNoticePopup notices={notices} residentId={text(resident.id)} />
       <header className="border-b border-slate-200 bg-white">
         <div className="mx-auto flex max-w-7xl items-center justify-between gap-4 px-4 py-5 sm:px-6 lg:px-8">
           <div className="flex-1">
@@ -557,8 +495,8 @@ export default function ResidentPortalPage() {
                   ["Contract Number", firstText(contract, ["contract_number"]) || "—"],
                   ["Start Date", firstText(contract, ["start_date"]).slice(0, 10) || "—"],
                   ["End Date", firstText(contract, ["end_date"]).slice(0, 10) || "—"],
-                  ["Monthly Rent", money(contract?.monthly_rent ?? 0)],
-                  ["Security Deposit", money(contract?.security_deposit ?? 0)],
+                  ["Monthly Rent", money(contract?.monthly_rent ?? admission?.monthly_rent ?? 0)],
+                  ["Security Deposit", money(contract?.security_deposit ?? admission?.security_deposit ?? 0)],
                   ["Status", firstText(contract, ["status"]) || "—"],
                   [
                     "Resident Signature",

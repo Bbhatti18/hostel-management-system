@@ -14,8 +14,13 @@ import {
   resolveAuthenticatedResident,
   type AuthenticatedResident,
 } from "@/lib/residentPortalAuth";
+import { loadResidentPortalData } from "@/lib/residentPortalData";
 import { deriveBillStatus, roundMoney } from "@/lib/financials";
 import { getSupabaseErrorMessage } from "@/lib/supabaseErrors";
+import {
+  notificationWarning,
+  requestEventNotification,
+} from "@/lib/notifications/client";
 
 type GenericRow = Record<string, unknown>;
 
@@ -68,6 +73,10 @@ function text(value: unknown) {
 
 function normalized(value: unknown) {
   return text(value).trim().toLowerCase();
+}
+
+function isPayableBill(status: unknown) {
+  return !["cancelled", "archived"].includes(normalized(status));
 }
 
 function money(value: unknown) {
@@ -131,28 +140,24 @@ export default function ResidentPaymentsPage() {
       return;
     }
 
-    const residentId = resolved.resident.id;
-    const [billsResult, paymentsResult, receiptsResult] = await Promise.all([
-      supabase.from("bills").select("*").eq("resident_id", residentId).order("billing_month", { ascending: false }),
-      supabase.from("payments").select("*").eq("resident_id", residentId).order("created_at", { ascending: false }),
-      supabase.from("payment_receipts").select("id, bill_id, resident_id, amount, reference_number, status, notes, created_at").eq("resident_id", residentId).order("created_at", { ascending: false }),
-    ]);
-
-    const loadError = billsResult.error || paymentsResult.error || receiptsResult.error;
-    if (loadError) {
-      setError(getSupabaseErrorMessage(loadError, "Your financial records could not be loaded. Please try again."));
+    const portalResult = await loadResidentPortalData();
+    if (
+      !portalResult.data ||
+      portalResult.data.resident.id !== resolved.resident.id
+    ) {
+      setError(portalResult.error || "Your resident account could not be verified.");
       setLoading(false);
       return;
     }
 
-    const paymentRows = (paymentsResult.data ?? []) as Payment[];
+    const paymentRows = portalResult.data.payments as Payment[];
     const verifiedByBill = new Map<string, number>();
     for (const payment of paymentRows) {
       if (normalized(payment.payment_status) !== "verified") continue;
       verifiedByBill.set(payment.bill_id, roundMoney((verifiedByBill.get(payment.bill_id) ?? 0) + Number(payment.amount || 0)));
     }
 
-    const calculatedBills = ((billsResult.data ?? []) as GenericRow[]).map((row) => {
+    const calculatedBills = portalResult.data.bills.map((row) => {
       const id = text(row.id);
       const paid = verifiedByBill.get(id) ?? 0;
       const total = Number(row.total_amount || 0);
@@ -171,10 +176,12 @@ export default function ResidentPaymentsPage() {
       } as Bill;
     });
 
-    setResident(resolved.resident);
+    setResident(portalResult.data.resident);
     setBills(calculatedBills);
     setPayments(paymentRows);
-    setReceipts((receiptsResult.data ?? []) as Receipt[]);
+    setReceipts(portalResult.data.receipts as Receipt[]);
+    setSelectedBillId("");
+    setAmount("");
     setLoading(false);
   }, []);
 
@@ -189,7 +196,7 @@ export default function ResidentPaymentsPage() {
   );
 
   const summary = useMemo(() => {
-    const operationalBills = bills.filter((bill) => normalized(bill.displayStatus) !== "cancelled");
+    const operationalBills = bills.filter((bill) => isPayableBill(bill.bill_status));
     return {
       outstanding: operationalBills.reduce((sum, bill) => sum + bill.outstanding, 0),
       pendingBills: operationalBills.filter((bill) => bill.outstanding > 0).length,
@@ -271,8 +278,8 @@ export default function ResidentPaymentsPage() {
       setUploading(false);
       return;
     }
-    if (normalized(currentBill.bill_status) === "cancelled") {
-      setError("Receipts cannot be submitted for a cancelled bill.");
+    if (!isPayableBill(currentBill.bill_status)) {
+      setError("Receipts cannot be submitted for a cancelled or archived bill.");
       setUploading(false);
       return;
     }
@@ -327,26 +334,36 @@ export default function ResidentPaymentsPage() {
 
     const { data: urlData } = supabase.storage.from("payment-receipts").getPublicUrl(filePath);
     const receiptNotes = [`Payment method: ${paymentMethod.trim()}`, notes.trim()].filter(Boolean).join("\n");
-    const { error: insertError } = await supabase.from("payment_receipts").insert({
-      resident_id: residentId,
-      bill_id: selectedBillId,
-      receipt_url: urlData.publicUrl,
-      original_file_name: selectedFile.name,
-      reference_number: reference || null,
-      amount: submittedAmount,
-      status: "Pending Verification",
-      verified: false,
-      notes: receiptNotes || null,
-      uploaded_at: new Date().toISOString(),
-      updated_at: new Date().toISOString(),
-    });
-    if (insertError) {
+    const { data: insertedReceipt, error: insertError } = await supabase
+      .from("payment_receipts")
+      .insert({
+        resident_id: residentId,
+        bill_id: selectedBillId,
+        receipt_url: urlData.publicUrl,
+        original_file_name: selectedFile.name,
+        reference_number: reference || null,
+        amount: submittedAmount,
+        status: "Pending Verification",
+        verified: false,
+        notes: receiptNotes || null,
+        uploaded_at: new Date().toISOString(),
+        updated_at: new Date().toISOString(),
+      })
+      .select("id")
+      .single();
+    if (insertError || !insertedReceipt) {
       setError("The receipt file was uploaded, but the submission could not be linked to your bill. It was not marked complete; please contact an administrator for review.");
       setUploading(false);
       return;
     }
 
-    setMessage("Receipt submitted for verification. Your balance will change only after admin approval.");
+    const notificationResult = await requestEventNotification(
+      "receipt_submitted",
+      insertedReceipt.id,
+    );
+    setMessage(
+      `Receipt submitted for verification. Your balance will change only after admin approval.${notificationWarning(notificationResult)}`,
+    );
     setSelectedBillId("");
     setAmount("");
     setPaymentMethod("");
@@ -379,8 +396,8 @@ export default function ResidentPaymentsPage() {
           <h2 className="text-xl font-bold">Upload Payment Receipt</h2>
           <p className="mt-1 text-sm text-slate-500">PDF, JPEG, or PNG; maximum 5 MB. Submission remains pending until verified.</p>
           <form onSubmit={uploadReceipt} className="mt-5 grid gap-4 md:grid-cols-2">
-            <label><span className="mb-2 block text-sm font-semibold">Bill *</span><select required value={selectedBillId} onChange={(event) => selectBill(event.target.value)} disabled={loading || uploading} className={inputClass}><option value="">Select an outstanding bill</option>{bills.filter((bill) => normalized(bill.displayStatus) !== "cancelled" && bill.outstanding > 0).map((bill) => <option key={bill.id} value={bill.id}>{bill.bill_number} — {monthLabel(bill.billing_month)} — {money(bill.outstanding)}</option>)}</select></label>
-            <label><span className="mb-2 block text-sm font-semibold">Amount *</span><input required type="number" min="0.01" step="0.01" max={selectedBill?.outstanding} value={amount} onChange={(event) => setAmount(event.target.value)} disabled={uploading} className={inputClass} /></label>
+            <label><span className="mb-2 block text-sm font-semibold">Bill *</span><select required value={selectedBillId} onChange={(event) => selectBill(event.target.value)} disabled={loading || uploading} className={inputClass}><option value="">Select an outstanding bill</option>{bills.filter((bill) => isPayableBill(bill.bill_status) && bill.outstanding > 0).map((bill) => <option key={bill.id} value={bill.id}>{bill.bill_number} — {monthLabel(bill.billing_month)} — {money(bill.outstanding)}</option>)}</select></label>
+            <label><span className="mb-2 block text-sm font-semibold">Amount *</span><input required type="number" min="0.01" step="0.01" max={selectedBill?.outstanding} value={amount} onChange={(event) => setAmount(event.target.value)} disabled={uploading || !selectedBill} className={inputClass} /></label>
             <label><span className="mb-2 block text-sm font-semibold">Payment Method *</span><input required value={paymentMethod} onChange={(event) => setPaymentMethod(event.target.value)} disabled={uploading} className={inputClass} placeholder="Cash deposit, bank transfer, card, etc." /></label>
             <label><span className="mb-2 block text-sm font-semibold">Reference Number</span><input value={referenceNumber} onChange={(event) => setReferenceNumber(event.target.value)} disabled={uploading} className={inputClass} placeholder="Transaction reference" /></label>
             <label className="md:col-span-2"><span className="mb-2 block text-sm font-semibold">Receipt File *</span><input id="payment-receipt-file" required type="file" accept="application/pdf,image/jpeg,image/png,.pdf,.jpg,.jpeg,.png" onChange={handleFileChange} disabled={uploading} className={inputClass} /></label>

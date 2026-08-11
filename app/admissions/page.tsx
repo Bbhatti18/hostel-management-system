@@ -22,6 +22,10 @@ import {
 import { supabase } from "@/lib/supabase";
 import { getSupabaseErrorMessage } from "@/lib/supabaseErrors";
 import {
+  notificationWarning,
+  requestEventNotification,
+} from "@/lib/notifications/client";
+import {
   ALLOCATABLE_BED_STATUSES,
   BED_STATUS,
   isAllocatableBedStatus,
@@ -232,12 +236,19 @@ export default function AdmissionsPage() {
   }, [refresh]);
 
   const filteredBeds = useMemo(() => {
-    return beds.filter(
-      (bed) =>
-        bed.room_id === form.room_id &&
-        isAllocatableBedStatus(bed.status),
-    ).sort(compareBedRecordsAscending);
-  }, [beds, form.room_id]);
+    const currentEditingBedId = editingId
+      ? admissions.find((admission) => admission.id === editingId)?.bed_id ?? null
+      : null;
+
+    return beds
+      .filter(
+        (bed) =>
+          bed.room_id === form.room_id &&
+          (isAllocatableBedStatus(bed.status) ||
+            bed.id === currentEditingBedId),
+      )
+      .sort(compareBedRecordsAscending);
+  }, [admissions, beds, editingId, form.room_id]);
 
   const filteredAdmissions = useMemo(() => {
     const query = search.trim().toLowerCase();
@@ -373,6 +384,7 @@ export default function AdmissionsPage() {
     }
 
     const previousAdmission = currentAdmissionData as Admission;
+    const residentId = previousAdmission.resident_id;
 
     const nextStatus: AdmissionStatus = previousAdmission.status;
     const targetIsCurrent = isCurrentAdmissionStatus(nextStatus);
@@ -391,7 +403,7 @@ export default function AdmissionsPage() {
         supabase
           .from("residents")
           .select("id, status")
-          .eq("id", form.resident_id)
+          .eq("id", residentId)
           .maybeSingle(),
         supabase
           .from("rooms")
@@ -407,7 +419,7 @@ export default function AdmissionsPage() {
           ? supabase
               .from("admissions")
               .select("id")
-              .eq("resident_id", form.resident_id)
+              .eq("resident_id", residentId)
               .in("status", ["Active", "Pending"])
               .neq("id", editingId)
               .limit(1)
@@ -486,7 +498,7 @@ export default function AdmissionsPage() {
     }
 
     const payload = {
-      resident_id: form.resident_id,
+      resident_id: residentId,
       room_id: form.room_id || null,
       bed_id: form.bed_id || null,
       admission_date: form.admission_date,
@@ -578,15 +590,62 @@ export default function AdmissionsPage() {
       );
 
       if (oldBedError) {
+        const { data: restoredAllocation, error: allocationRollbackError } =
+          await supabase
+            .from("admissions")
+            .update({
+              room_id: previousAdmission.room_id,
+              bed_id: previousAdmission.bed_id,
+              updated_at: new Date().toISOString(),
+            })
+            .eq("id", editingId)
+            .eq("room_id", form.room_id)
+            .eq("bed_id", form.bed_id)
+            .select("id")
+            .maybeSingle();
+
+        if (allocationRollbackError || !restoredAllocation) {
+          setError(
+            "Admission updated, but the previous bed could not be released and the room move could not be rolled back. Please contact an administrator.",
+          );
+          await refresh();
+          setSaving(false);
+          return;
+        }
+
+        const { data: releasedNewBed, error: newBedReleaseError } =
+          await supabase
+            .from("beds")
+            .update({ status: BED_STATUS.VACANT })
+            .eq("id", form.bed_id)
+            .eq("status", BED_STATUS.OCCUPIED)
+            .select("id")
+            .maybeSingle();
+
         setError(
-          "Admission updated, but the previous bed could not be released automatically. Please contact an administrator.",
+          newBedReleaseError || !releasedNewBed
+            ? "The room move was rolled back, but the newly selected bed could not be released automatically. Please contact an administrator."
+            : "The previous bed could not be released, so the room and bed move was rolled back. Other admission changes were saved.",
         );
         await refresh();
         setSaving(false);
         return;
       }
     }
+    const currentContract = contracts.find(
+      (item) => item.admission_id === editingId,
+    );
 
+    const shouldAutoActivate =
+      previousAdmission.status === "Pending" &&
+      isAdmissionReadyForActivation(form.deposit_status, currentContract);
+
+    if (shouldAutoActivate) {
+      closeEditForm();
+      setSaving(false);
+      await activateAdmission(editingId);
+      return;
+    }
     setMessage("Admission updated successfully.");
     closeEditForm();
     await refresh();
@@ -595,9 +654,11 @@ export default function AdmissionsPage() {
   }
 
   async function loadLifecycleContext(admissionId: string) {
-    const { data: admission, error: admissionError } = await supabase
-      .from("admissions")
-      .select("id, resident_id, room_id, bed_id, status, deposit_status")
+      const { data: admission, error: admissionError } = await supabase
+        .from("admissions")
+        .select(
+          "id, resident_id, room_id, bed_id, status, deposit_status, actual_leaving_date",
+        )
       .eq("id", admissionId)
       .maybeSingle();
 
@@ -729,7 +790,7 @@ export default function AdmissionsPage() {
 
       const previousContractStatus = context.contract.status;
       const previousLegacyContractStatus = context.contract.contract_status;
-      const { data: activatedContract, error: contractActivateError } = await supabase
+      let contractActivation = supabase
         .from("contracts")
         .update({
           status: "Active",
@@ -737,6 +798,17 @@ export default function AdmissionsPage() {
           updated_at: new Date().toISOString(),
         })
         .eq("id", context.contract.id)
+        .eq("resident_signature_status", "Approved");
+
+      contractActivation = previousContractStatus
+        ? contractActivation.eq("status", previousContractStatus)
+        : contractActivation.is("status", null);
+      contractActivation = previousLegacyContractStatus
+        ? contractActivation.eq("contract_status", previousLegacyContractStatus)
+        : contractActivation.is("contract_status", null);
+
+      const { data: activatedContract, error: contractActivateError } =
+        await contractActivation
         .select("id")
         .maybeSingle();
 
@@ -760,17 +832,21 @@ export default function AdmissionsPage() {
         .maybeSingle();
 
       if (activateError || !activated) {
-        const { error: rollbackError } = await supabase
+        const { data: rolledBackContract, error: rollbackError } = await supabase
           .from("contracts")
           .update({
             status: previousContractStatus,
             contract_status: previousLegacyContractStatus,
             updated_at: new Date().toISOString(),
           })
-          .eq("id", context.contract.id);
+          .eq("id", context.contract.id)
+          .eq("status", "Active")
+          .eq("contract_status", "Active")
+          .select("id")
+          .maybeSingle();
 
         throw new Error(
-          rollbackError
+          rollbackError || !rolledBackContract
             ? "Admission activation failed and the contract could not be returned to its previous status. The resident signature and terms were preserved; contact an administrator."
             : activateError
             ? getSupabaseErrorMessage(
@@ -789,6 +865,262 @@ export default function AdmissionsPage() {
         activationError instanceof Error
           ? activationError.message
           : "Unable to activate this admission.",
+      );
+      await refresh();
+      setAdmissionDataVersion((current) => current + 1);
+    } finally {
+      setLifecycleActionId(null);
+    }
+  }
+
+  async function approveContractFromAdmission(admissionId: string) {
+    const confirmed = window.confirm(
+      "Approve the resident signature for this admission?",
+    );
+    if (!confirmed) return;
+
+    setLifecycleActionId(admissionId);
+    setMessage("");
+    setError("");
+
+    try {
+      const { data: admission, error: admissionError } = await supabase
+        .from("admissions")
+        .select("id, status, deposit_status")
+        .eq("id", admissionId)
+        .maybeSingle();
+
+      if (admissionError || !admission) {
+        throw new Error(
+          admissionError
+            ? getSupabaseErrorMessage(
+                admissionError,
+                "Unable to verify this admission.",
+              )
+            : "The admission could not be found.",
+        );
+      }
+
+      if (admission.status !== "Pending") {
+        throw new Error(
+          "Only a Pending admission can have its resident signature approved here.",
+        );
+      }
+
+      const { data: currentContract, error: contractError } = await supabase
+        .from("contracts")
+        .select(
+          "id, admission_id, status, contract_status, resident_signature, resident_signature_url, resident_signature_status, signed_by_resident, signed_at, contract_content, terms",
+        )
+        .eq("admission_id", admissionId)
+        .order("created_at", { ascending: false })
+        .limit(1)
+        .maybeSingle();
+
+      if (contractError || !currentContract) {
+        throw new Error(
+          contractError
+            ? getSupabaseErrorMessage(
+                contractError,
+                "Unable to verify the contract for this admission.",
+              )
+            : "No contract is linked to this admission.",
+        );
+      }
+
+      if (
+        (currentContract.status || currentContract.contract_status) !==
+        "Pending Signature"
+      ) {
+        throw new Error(
+          "Only a Pending Signature contract can be approved from Admissions.",
+        );
+      }
+
+      const currentSignatureStatus =
+        currentContract.resident_signature_status || "Pending";
+
+      const hasStoredSignature = Boolean(
+        (currentContract.resident_signature_url ||
+          currentContract.resident_signature) &&
+          currentContract.signed_by_resident &&
+          currentContract.signed_at,
+      );
+
+      if (
+        !["Submitted", "Signed"].includes(currentSignatureStatus) ||
+        !hasStoredSignature
+      ) {
+        throw new Error(
+          "Only a complete submitted resident signature can be approved.",
+        );
+      }
+
+      let contractApproval = supabase
+        .from("contracts")
+        .update({
+          resident_signature_status: "Approved",
+          updated_at: new Date().toISOString(),
+        })
+        .eq("id", currentContract.id)
+        .eq(
+          "resident_signature_status",
+          currentContract.resident_signature_status,
+        );
+
+      contractApproval = currentContract.status
+        ? contractApproval.eq("status", currentContract.status)
+        : contractApproval.is("status", null);
+      contractApproval = currentContract.contract_status
+        ? contractApproval.eq("contract_status", currentContract.contract_status)
+        : contractApproval.is("contract_status", null);
+
+      const { data: approved, error: approveError } = await contractApproval
+        .select("id")
+        .maybeSingle();
+
+      if (approveError || !approved) {
+        throw new Error(
+          approveError
+            ? getSupabaseErrorMessage(
+                approveError,
+                "Unable to approve the resident signature.",
+              )
+            : "The signature status changed before approval completed. Refresh and try again.",
+        );
+      }
+
+      if (admission.deposit_status === "Received") {
+        await activateAdmission(admissionId);
+        const notificationResult = await requestEventNotification(
+          "contract_approved",
+          currentContract.id,
+        );
+        if (notificationResult.warning) {
+          setMessage((current) =>
+            `${current || "Resident signature approved."}${notificationWarning(notificationResult)}`,
+          );
+        }
+        return;
+      }
+
+      const notificationResult = await requestEventNotification(
+        "contract_approved",
+        currentContract.id,
+      );
+      setMessage(
+        `Resident signature approved. Admission remains Pending until the security deposit is received.${notificationWarning(notificationResult)}`,
+      );
+      await refresh();
+      setAdmissionDataVersion((current) => current + 1);
+    } catch (approvalError) {
+      setError(
+        approvalError instanceof Error
+          ? approvalError.message
+          : "Unable to approve the resident signature.",
+      );
+      await refresh();
+      setAdmissionDataVersion((current) => current + 1);
+    } finally {
+      setLifecycleActionId(null);
+    }
+  }
+
+  async function receiveDepositFromAdmission(admission: Admission) {
+    const confirmed = window.confirm(
+      `Mark the security deposit of ${money(
+        admission.security_deposit,
+      )} as Received for this admission?`,
+    );
+    if (!confirmed) return;
+
+    setLifecycleActionId(admission.id);
+    setMessage("");
+    setError("");
+
+    try {
+      const { data: currentAdmission, error: admissionError } = await supabase
+        .from("admissions")
+        .select("id, status, deposit_status")
+        .eq("id", admission.id)
+        .maybeSingle();
+
+      if (admissionError || !currentAdmission) {
+        throw new Error(
+          admissionError
+            ? getSupabaseErrorMessage(
+                admissionError,
+                "Unable to verify this admission.",
+              )
+            : "The admission could not be found.",
+        );
+      }
+
+      if (currentAdmission.status !== "Pending") {
+        throw new Error(
+          "Only a Pending admission can have its deposit received from this action.",
+        );
+      }
+
+      if (currentAdmission.deposit_status !== "Received") {
+        const { data: received, error: receiveError } = await supabase
+          .from("admissions")
+          .update({
+            deposit_status: "Received",
+            updated_at: new Date().toISOString(),
+          })
+          .eq("id", admission.id)
+          .eq("status", "Pending")
+          .eq("deposit_status", currentAdmission.deposit_status)
+          .select("id")
+          .maybeSingle();
+
+        if (receiveError || !received) {
+          throw new Error(
+            receiveError
+              ? getSupabaseErrorMessage(
+                  receiveError,
+                  "Unable to mark the security deposit as received.",
+                )
+              : "The admission changed before the deposit update completed. Refresh and try again.",
+          );
+        }
+      }
+
+      const { data: currentContract, error: contractError } = await supabase
+        .from("contracts")
+        .select(
+          "id, admission_id, status, contract_status, resident_signature, resident_signature_url, resident_signature_status, signed_by_resident, signed_at, contract_content, terms",
+        )
+        .eq("admission_id", admission.id)
+        .order("created_at", { ascending: false })
+        .limit(1)
+        .maybeSingle();
+
+      if (contractError) {
+        throw new Error(
+          getSupabaseErrorMessage(
+            contractError,
+            "Deposit was received, but the contract could not be verified.",
+          ),
+        );
+      }
+
+      if (isContractSignedAndAccepted(currentContract as AdmissionContract | null)) {
+        await activateAdmission(admission.id);
+        return;
+      }
+
+      setMessage(
+        "Security deposit received. Admission remains Pending until the resident signature is approved.",
+      );
+      await refresh();
+      setAdmissionDataVersion((current) => current + 1);
+    } catch (depositError) {
+      setError(
+        depositError instanceof Error
+          ? depositError.message
+          : "Unable to receive the security deposit.",
       );
       await refresh();
       setAdmissionDataVersion((current) => current + 1);
@@ -856,8 +1188,23 @@ export default function AdmissionsPage() {
         context.admission.bed_id,
       );
       if (bedError) {
+        const { data: restoredAdmission, error: restoreError } = await supabase
+          .from("admissions")
+          .update({
+            status: context.admission.status,
+            actual_leaving_date:
+              context.admission.actual_leaving_date ?? null,
+            updated_at: new Date().toISOString(),
+          })
+          .eq("id", admissionId)
+          .eq("status", nextStatus)
+          .select("id")
+          .maybeSingle();
+
         throw new Error(
-          `Admission marked ${nextStatus}, but its bed could not be released automatically. Please contact an administrator.`,
+          restoreError || !restoredAdmission
+            ? `Admission was marked ${nextStatus}, but its bed could not be released and its previous status could not be restored. Please contact an administrator.`
+            : `The bed could not be released, so the admission was returned to ${context.admission.status}. No lifecycle change was kept.`,
         );
       }
 
@@ -919,8 +1266,21 @@ export default function AdmissionsPage() {
         context.admission.bed_id,
       );
       if (bedError) {
+        const { data: restoredAdmission, error: restoreError } = await supabase
+          .from("admissions")
+          .update({
+            status: context.admission.status,
+            updated_at: new Date().toISOString(),
+          })
+          .eq("id", admissionId)
+          .eq("status", "Archived")
+          .select("id")
+          .maybeSingle();
+
         throw new Error(
-          "Admission archived, but its bed could not be released automatically. Please contact an administrator.",
+          restoreError || !restoredAdmission
+            ? "Admission was archived, but its bed could not be released and its previous status could not be restored. Please contact an administrator."
+            : `The bed could not be released, so the admission was returned to ${context.admission.status}. No archive change was kept.`,
         );
       }
 
@@ -1007,11 +1367,8 @@ export default function AdmissionsPage() {
                   <select
                     required
                     value={form.resident_id}
-                    onChange={(event) =>
-                      updateField("resident_id", event.target.value)
-                    }
                     className={inputClass}
-                    disabled={saving}
+                    disabled
                   >
                     <option value="">Select resident</option>
                     {residents
@@ -1336,13 +1693,28 @@ export default function AdmissionsPage() {
                     const isHistorical = ["Completed", "Cancelled"].includes(
                       admission.status,
                     );
-                    const contract = contracts.find(
-                      (item) => item.admission_id === admission.id,
-                    );
-                    const contractSigned = isContractSignedAndAccepted(contract);
-                    const depositVerified = isDepositVerified(
-                      admission.deposit_status,
-                    );
+const contract = contracts.find(
+  (item) => item.admission_id === admission.id,
+);
+
+const contractSigned = isContractSignedAndAccepted(contract);
+
+const signatureStatus =
+  contract?.resident_signature_status ?? "Pending";
+
+const contractSignatureLabel = contractSigned
+  ? "Yes"
+  : signatureStatus === "Submitted" || signatureStatus === "Signed"
+    ? "Awaiting Approval"
+    : signatureStatus === "Rejected"
+      ? "Rejected"
+      : signatureStatus === "Re-sign Required"
+        ? "Re-sign Required"
+        : "No";
+
+const depositVerified = isDepositVerified(
+  admission.deposit_status,
+);
                     const hasAllocationConflict = admissions.some(
                       (item) =>
                         item.id !== admission.id &&
@@ -1366,55 +1738,70 @@ export default function AdmissionsPage() {
                           isArchived ? "bg-slate-50/60" : ""
                         }`}
                       >
-                        <td className="px-5 py-4">
-                          <p className="font-semibold text-slate-900">
-                            {resident?.full_name || "Unknown resident"}
-                          </p>
-                        </td>
+     <td className="px-5 py-4">
+  <p className="font-semibold text-slate-900">
+    {resident?.full_name || "Unknown resident"}
+  </p>
+</td>
 
-                        <td className="px-5 py-4 text-sm text-slate-700">
-                          <p>Room: {room?.room_number || "Not allocated"}</p>
-                          <p className="mt-1 text-xs text-slate-500">
-                            Bed: {bed ? normalizeBedLabel(bed.bed_number) : "Not allocated"}
-                          </p>
-                        </td>
+<td className="px-5 py-4 text-sm text-slate-700">
+  <p>Room: {room?.room_number || "Not allocated"}</p>
+  <p className="mt-1 text-xs text-slate-500">
+    Bed: {bed ? normalizeBedLabel(bed.bed_number) : "Not allocated"}
+  </p>
+</td>
 
-                        <td className="px-5 py-4 text-sm text-slate-700">
-                          <p>Admission: {admission.admission_date}</p>
-                          <p className="mt-1 text-xs text-slate-500">
-                            Leaving:{" "}
-                            {admission.expected_leaving_date || "Not set"}
-                          </p>
-                        </td>
+<td className="px-5 py-4 text-sm text-slate-700">
+  <p>Admission: {admission.admission_date}</p>
+  <p className="mt-1 text-xs text-slate-500">
+    Leaving: {admission.expected_leaving_date || "Not set"}
+  </p>
+</td>
 
-                        <td className="px-5 py-4 text-sm text-slate-700">
-                          <p>Rent: {money(admission.monthly_rent)}</p>
-                          <p className="mt-1 text-xs text-slate-500">
-                            Deposit: {money(admission.security_deposit)}
-                          </p>
+<td className="px-5 py-4 text-sm text-slate-700">
+  <p>Rent: {money(admission.monthly_rent)}</p>
 
-                          <span
-                            className={`mt-2 inline-flex rounded-full px-3 py-1 text-xs font-bold ${depositStatusClass(
-                              admission.deposit_status
-                            )}`}
-                          >
-                            Deposit {depositVerified ? "Verified" : admission.deposit_status}
-                          </span>
-                        </td>
+  <p className="mt-1 text-xs text-slate-500">
+    Deposit: {money(admission.security_deposit)}
+  </p>
 
-                        <td className="px-5 py-4 text-sm">
-                          <span className={`rounded-full px-3 py-1 text-xs font-bold ${contractSigned ? "bg-emerald-100 text-emerald-700" : "bg-amber-100 text-amber-700"}`}>
-                            {contractSigned ? "Yes" : "No"}
-                          </span>
-                        </td>
+  <span
+    className={`mt-2 inline-flex rounded-full px-3 py-1 text-xs font-bold ${depositStatusClass(
+      admission.deposit_status
+    )}`}
+  >
+    Deposit {depositVerified ? "Verified" : admission.deposit_status}
+  </span>
+</td>
 
-                        <td className="px-5 py-4 text-sm">
-                          <span className={`rounded-full px-3 py-1 text-xs font-bold ${readyForActivation ? "bg-emerald-100 text-emerald-700" : "bg-slate-100 text-slate-600"}`}>
-                            {readyForActivation ? "Ready" : "Not Ready"}
-                          </span>
-                        </td>
+<td className="px-5 py-4 text-sm">
+  <span
+    className={`rounded-full px-3 py-1 text-xs font-bold ${
+      contractSigned
+        ? "bg-emerald-100 text-emerald-700"
+        : signatureStatus === "Submitted" || signatureStatus === "Signed"
+          ? "bg-blue-100 text-blue-700"
+          : signatureStatus === "Rejected"
+            ? "bg-red-100 text-red-700"
+            : "bg-amber-100 text-amber-700"
+    }`}
+  >
+    {contractSignatureLabel}
+  </span>
+</td>
 
-                        <td className="px-5 py-4">
+<td className="px-5 py-4 text-sm">
+  <span
+    className={`rounded-full px-3 py-1 text-xs font-bold ${
+      readyForActivation
+        ? "bg-emerald-100 text-emerald-700"
+        : "bg-slate-100 text-slate-600"
+    }`}
+  >
+    {readyForActivation ? "Ready" : "Not Ready"}
+  </span>
+</td>
+                         <td className="px-5 py-4">
                           <span
                             className={`inline-flex rounded-full px-3 py-1 text-xs font-bold ${admissionStatusClass(
                               admission.status
@@ -1431,6 +1818,43 @@ export default function AdmissionsPage() {
                             </span>
                           ) : (
                             <div className="flex flex-wrap gap-2">
+                              {admission.status === "Pending" &&
+                                contract &&
+                                ["Submitted", "Signed"].includes(
+                                  signatureStatus,
+                                ) && (
+                                  <button
+                                    type="button"
+                                    onClick={() =>
+                                      void approveContractFromAdmission(
+                                        admission.id,
+                                      )
+                                    }
+                                    disabled={isLifecycleAction || isArchiving}
+                                    className="rounded-lg border border-blue-200 px-3 py-2 text-xs font-semibold text-blue-700 transition hover:bg-blue-50 disabled:cursor-not-allowed disabled:opacity-60"
+                                  >
+                                    {isLifecycleAction
+                                      ? "Working..."
+                                      : "Approve Contract"}
+                                  </button>
+                                )}
+
+                              {admission.status === "Pending" &&
+                                !depositVerified && (
+                                  <button
+                                    type="button"
+                                    onClick={() =>
+                                      void receiveDepositFromAdmission(admission)
+                                    }
+                                    disabled={isLifecycleAction || isArchiving}
+                                    className="rounded-lg border border-emerald-200 px-3 py-2 text-xs font-semibold text-emerald-700 transition hover:bg-emerald-50 disabled:cursor-not-allowed disabled:opacity-60"
+                                  >
+                                    {isLifecycleAction
+                                      ? "Working..."
+                                      : "Receive Deposit"}
+                                  </button>
+                                )}
+
                               {admission.status === "Pending" &&
                                 readyForActivation && (
                                   <button

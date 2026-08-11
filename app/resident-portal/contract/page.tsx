@@ -17,6 +17,7 @@ import {
 } from "@/lib/contractStorage";
 import { getContractTerms, hasResidentSignature } from "@/lib/contractWorkflow";
 import { resolveAuthenticatedResident } from "@/lib/residentPortalAuth";
+import { loadResidentPortalData } from "@/lib/residentPortalData";
 import { supabase } from "@/lib/supabase";
 import { getSupabaseErrorMessage } from "@/lib/supabaseErrors";
 
@@ -30,6 +31,8 @@ type Contract = {
   terms: string | null;
   start_date: string;
   end_date: string | null;
+  monthly_rent: number | null;
+  security_deposit: number | null;
   notice_period_days: number;
   status: string | null;
   contract_status: string | null;
@@ -61,7 +64,6 @@ type PortalContract = {
   agreementUrl: string | null;
 };
 
-const pendingStatuses = new Set(["Draft", "Pending Signature"]);
 const signatureUploadTypes = new Set(["image/png", "image/jpeg"]);
 const maxSignatureBytes = 5 * 1024 * 1024;
 
@@ -95,62 +97,27 @@ export default function ResidentContractPage() {
       return;
     }
 
-    const { data: contractRows, error: contractError } = await supabase
-      .from("contracts")
-      .select(
-        "id, contract_number, resident_id, admission_id, template_id, contract_content, terms, start_date, end_date, notice_period_days, status, contract_status, resident_signature, resident_signature_url, resident_signature_status, owner_signature_status, signed_by_resident, signed_at, created_at",
-      )
-      .eq("resident_id", auth.resident.id)
-      .order("created_at", { ascending: false });
-
-    if (contractError) {
-      setError(getSupabaseErrorMessage(contractError, "Unable to load your contract."));
+    const portalResult = await loadResidentPortalData();
+    if (!portalResult.data || portalResult.data.resident.id !== auth.resident.id) {
+      setData(null);
+      setError(portalResult.error || "Your resident account could not be verified.");
       setLoading(false);
       return;
     }
 
-    const contract = ((contractRows ?? []) as Contract[]).find((item) => {
-      const status = item.status || item.contract_status || "Draft";
-      return pendingStatuses.has(status) || status === "Active";
-    });
+    const admission = portalResult.data.admission as Admission | null;
+    if (!admission) {
+      setData(null);
+      setError("No current admission is available for your resident account.");
+      setLoading(false);
+      return;
+    }
 
-    if (!contract?.admission_id) {
+    const contract = portalResult.data.contract as Contract | null;
+
+    if (!contract) {
       setData(null);
       setError("No contract is currently prepared for your admission.");
-      setLoading(false);
-      return;
-    }
-
-    const { data: admission, error: admissionError } = await supabase
-      .from("admissions")
-      .select(
-        "id, resident_id, room_id, bed_id, admission_date, monthly_rent, security_deposit, status",
-      )
-      .eq("id", contract.admission_id)
-      .eq("resident_id", auth.resident.id)
-      .maybeSingle();
-
-    if (admissionError || !admission) {
-      setError(
-        admissionError
-          ? getSupabaseErrorMessage(admissionError, "Unable to verify your admission.")
-          : "This contract is not linked to your current admission.",
-      );
-      setLoading(false);
-      return;
-    }
-
-    const [roomResult, bedResult] = await Promise.all([
-      admission.room_id
-        ? supabase.from("rooms").select("room_number").eq("id", admission.room_id).maybeSingle()
-        : Promise.resolve({ data: null, error: null }),
-      admission.bed_id
-        ? supabase.from("beds").select("bed_number").eq("id", admission.bed_id).maybeSingle()
-        : Promise.resolve({ data: null, error: null }),
-    ]);
-
-    if (roomResult.error || bedResult.error) {
-      setError("Unable to load the room and bed assigned to this contract.");
       setLoading(false);
       return;
     }
@@ -166,9 +133,9 @@ export default function ResidentContractPage() {
       contract,
       admission: admission as Admission,
       residentName: auth.resident.full_name || "Resident",
-      roomNumber: roomResult.data?.room_number || "Not allocated",
-      bedNumber: bedResult.data?.bed_number
-        ? normalizeBedLabel(bedResult.data.bed_number)
+      roomNumber: String(portalResult.data.room?.room_number || "Not allocated"),
+      bedNumber: portalResult.data.bed?.bed_number
+        ? normalizeBedLabel(String(portalResult.data.bed.bed_number))
         : "Not allocated",
       agreementUrl,
     });
@@ -288,7 +255,7 @@ export default function ResidentContractPage() {
         signatureFileName,
       );
       const signedAt = new Date().toISOString();
-      const { data: signedContract, error: updateError } = await supabase
+      let signatureUpdate = supabase
         .from("contracts")
         .update({
           resident_signature: signatureUrl,
@@ -302,6 +269,16 @@ export default function ResidentContractPage() {
         })
         .eq("id", current.id)
         .eq("resident_id", auth.resident.id)
+        .eq("resident_signature_status", signatureStatus);
+
+      signatureUpdate = current.status
+        ? signatureUpdate.eq("status", current.status)
+        : signatureUpdate.is("status", null);
+      signatureUpdate = current.contract_status
+        ? signatureUpdate.eq("contract_status", current.contract_status)
+        : signatureUpdate.is("contract_status", null);
+
+      const { data: signedContract, error: updateError } = await signatureUpdate
         .select("id")
         .maybeSingle();
 
@@ -323,7 +300,6 @@ export default function ResidentContractPage() {
       setSaving(false);
     }
   }
-
   if (loading) {
     return <main className="min-h-screen bg-slate-50 p-8 text-slate-600">Loading your contract...</main>;
   }
@@ -368,8 +344,8 @@ export default function ResidentContractPage() {
           <InfoCard label="Room / Bed" value={`${data.roomNumber} / ${data.bedNumber}`} />
           <InfoCard label="Admission Date" value={data.admission.admission_date} />
           <InfoCard label="Start / End" value={`${data.contract.start_date} / ${data.contract.end_date || "Open-ended"}`} />
-          <InfoCard label="Monthly Rent" value={money(data.admission.monthly_rent)} />
-          <InfoCard label="Security Deposit" value={money(data.admission.security_deposit)} />
+          <InfoCard label="Monthly Rent" value={money(data.contract.monthly_rent ?? data.admission.monthly_rent)} />
+          <InfoCard label="Security Deposit" value={money(data.contract.security_deposit ?? data.admission.security_deposit)} />
           <InfoCard label="Notice Period" value={`${data.contract.notice_period_days || 30} days`} />
           <InfoCard label="Resident Signature" value={signatureStatus} />
         </section>

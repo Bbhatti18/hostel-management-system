@@ -12,18 +12,21 @@ import {
 import { supabase } from "@/lib/supabase";
 import Link from "next/link";
 import { getSupabaseErrorMessage } from "@/lib/supabaseErrors";
-import { safeStorageFileName, validateImageFile } from "@/lib/imageValidation";
+import { optimizeImageForUpload, safeStorageFileName, validateImageFile } from "@/lib/imageValidation";
+import { MAINTENANCE_PHOTO_BUCKET, maintenancePhotoUrl } from "@/lib/maintenanceStorage";
 
 type GenericRow = Record<string, unknown>;
 
 type Priority = "Low" | "Medium" | "High" | "Emergency";
-type RequestStatus = "Pending" | "In Progress" | "Completed" | "Cancelled";
+type RequestStatus = "Open" | "Pending" | "In Progress" | "Completed" | "Cancelled" | "Archived";
 
 type MaintenanceRequest = {
   id: string;
   request_number: string;
   resident_id: string | null;
+  admission_id: string | null;
   room_id: string | null;
+  bed_id: string | null;
   title: string | null;
   category: string | null;
   description: string | null;
@@ -34,6 +37,7 @@ type MaintenanceRequest = {
   estimated_cost: number;
   actual_cost: number;
   photo_url: string | null;
+  complaint_date: string | null;
   completion_date: string | null;
   completed_at: string | null;
   assigned_date: string | null;
@@ -47,7 +51,9 @@ type MaintenanceRequest = {
 
 type MaintenanceForm = {
   resident_id: string;
+  admission_id: string;
   room_id: string;
+  bed_id: string;
   title: string;
   category: string;
   description: string;
@@ -56,21 +62,36 @@ type MaintenanceForm = {
   assigned_to: string;
   estimated_cost: string;
   actual_cost: string;
+  reported_date: string;
   completion_date: string;
   notes: string;
 };
 
+type CurrentMaintenanceRequest = {
+  status: RequestStatus;
+  resident_id: string | null;
+  admission_id: string | null;
+  room_id: string | null;
+  bed_id: string | null;
+  assigned_date: string | null;
+  completion_date: string | null;
+  completed_at: string | null;
+};
+
 const emptyForm: MaintenanceForm = {
   resident_id: "",
+  admission_id: "",
   room_id: "",
+  bed_id: "",
   title: "",
   category: "Other",
   description: "",
   priority: "Medium",
-  status: "Pending",
+  status: "Open",
   assigned_to: "",
   estimated_cost: "0",
   actual_cost: "0",
+  reported_date: new Date().toISOString().slice(0, 10),
   completion_date: "",
   notes: "",
 };
@@ -87,6 +108,12 @@ function photoList(value: unknown): string[] {
     ? value.filter((item): item is string => typeof item === "string" && item.length > 0)
     : [];
 }
+
+function photoUrls(value: unknown) {
+  return photoList(value).map(maintenancePhotoUrl);
+}
+
+const MAX_FILES_PER_CATEGORY = 12;
 
 function firstText(row: GenericRow | undefined, keys: string[]) {
   if (!row) return "";
@@ -139,6 +166,7 @@ function statusClass(status: RequestStatus) {
   if (status === "Completed") return "bg-emerald-100 text-emerald-700";
   if (status === "In Progress") return "bg-blue-100 text-blue-700";
   if (status === "Cancelled") return "bg-slate-200 text-slate-700";
+  if (status === "Archived") return "bg-slate-300 text-slate-700";
   return "bg-amber-100 text-amber-700";
 }
 
@@ -152,6 +180,7 @@ export default function MaintenancePage() {
   const [requests, setRequests] = useState<MaintenanceRequest[]>([]);
   const [residents, setResidents] = useState<GenericRow[]>([]);
   const [rooms, setRooms] = useState<GenericRow[]>([]);
+  const [beds, setBeds] = useState<GenericRow[]>([]);
   const [admissions, setAdmissions] = useState<GenericRow[]>([]);
   const [form, setForm] = useState<MaintenanceForm>(emptyForm);
   const [photoFile, setPhotoFile] = useState<File | null>(null);
@@ -163,7 +192,7 @@ export default function MaintenancePage() {
   const [showForm, setShowForm] = useState(false);
   const [search, setSearch] = useState("");
   const [priorityFilter, setPriorityFilter] = useState("All");
-  const [statusFilter, setStatusFilter] = useState("All");
+  const [statusFilter, setStatusFilter] = useState("Current");
   const [categoryFilter, setCategoryFilter] = useState("All");
   const [roomFilter, setRoomFilter] = useState("All");
   const [residentFilter, setResidentFilter] = useState("All");
@@ -177,7 +206,7 @@ export default function MaintenancePage() {
     setLoading(true);
     setError("");
 
-    const [requestsResult, residentsResult, roomsResult, admissionsResult] = await Promise.all([
+    const [requestsResult, residentsResult, roomsResult, bedsResult, admissionsResult] = await Promise.all([
       supabase
         .from("maintenance_requests")
         .select("*")
@@ -190,13 +219,15 @@ export default function MaintenancePage() {
         .from("rooms")
         .select("*")
         .order("created_at", { ascending: false }),
-      supabase.from("admissions").select("id,resident_id,room_id,status"),
+      supabase.from("beds").select("id,room_id,bed_number,status"),
+      supabase.from("admissions").select("id,resident_id,room_id,bed_id,status,admission_date"),
     ]);
 
     const firstError =
       requestsResult.error ||
       residentsResult.error ||
-      roomsResult.error;
+      roomsResult.error ||
+      bedsResult.error;
 
     const loadError = firstError || admissionsResult.error;
 
@@ -208,6 +239,7 @@ export default function MaintenancePage() {
       );
       setResidents((residentsResult.data ?? []) as GenericRow[]);
       setRooms((roomsResult.data ?? []) as GenericRow[]);
+      setBeds((bedsResult.data ?? []) as GenericRow[]);
       setAdmissions((admissionsResult.data ?? []) as GenericRow[]);
     }
 
@@ -251,7 +283,9 @@ export default function MaintenancePage() {
 
       const matchesStatus =
         statusFilter === "All" ||
-        request.status === statusFilter;
+        (statusFilter === "Current"
+          ? request.status !== "Archived"
+          : request.status === statusFilter);
 
       const matchesCategory = categoryFilter === "All" || request.category === categoryFilter;
       const matchesRoom = roomFilter === "All" || request.room_id === roomFilter;
@@ -328,7 +362,9 @@ export default function MaintenancePage() {
     setEditingId(request.id);
     setForm({
       resident_id: request.resident_id ?? "",
+      admission_id: request.admission_id ?? "",
       room_id: request.room_id ?? "",
+      bed_id: request.bed_id ?? "",
       title: request.title ?? "",
       category: request.category ?? "Other",
       description: request.description ?? request.complaint_description ?? "",
@@ -337,6 +373,7 @@ export default function MaintenancePage() {
       assigned_to: request.assigned_to ?? "",
       estimated_cost: String(request.estimated_cost ?? 0),
       actual_cost: String(request.actual_cost ?? 0),
+      reported_date: request.complaint_date ?? request.created_at.slice(0, 10),
       completion_date: request.completion_date ?? "",
       notes: request.notes ?? "",
     });
@@ -353,23 +390,22 @@ export default function MaintenancePage() {
     requestId: string,
     kind: "before" | "during" | "after"
   ) {
-    const urls: string[] = [];
+    const paths: string[] = [];
 
     for (let index = 0; index < files.length; index += 1) {
-      setUploading(`Uploading ${kind} photo ${index + 1} of ${files.length}...`);
-      const path = `requests/${requestId}/${kind}/${Date.now()}-${index}-${safeStorageFileName(files[index])}`;
+      setUploading(`Optimizing and uploading ${kind} photo ${index + 1} of ${files.length}...`);
+      const optimized = await optimizeImageForUpload(files[index]);
+      const path = `maintenance/${requestId}/${kind}/${Date.now()}-${index}-${safeStorageFileName(optimized.file)}`;
       const { error: uploadError } = await supabase.storage
-        .from("maintenance-photos")
-        .upload(path, files[index], { cacheControl: "3600", upsert: false });
+        .from(MAINTENANCE_PHOTO_BUCKET)
+        .upload(path, optimized.file, { cacheControl: "31536000", contentType: optimized.file.type, upsert: false });
 
       if (uploadError) throw new Error("PHOTO_UPLOAD");
 
-      urls.push(
-        supabase.storage.from("maintenance-photos").getPublicUrl(path).data.publicUrl
-      );
+      paths.push(path);
     }
 
-    return urls;
+    return paths;
   }
 
   async function saveRequest(event: FormEvent<HTMLFormElement>) {
@@ -379,49 +415,66 @@ export default function MaintenancePage() {
     setMessage("");
     setError("");
 
-    if (!form.title.trim()) {
-      setError("Request title is required.");
+    if (!form.title.trim() || !form.room_id || !form.reported_date) {
+      setError("Request title, room, and reported date are required.");
       setSaving(false);
       return;
     }
 
     try {
-      if (Number(form.estimated_cost) < 0 || Number(form.actual_cost) < 0) {
+      const estimatedCost = Number(form.estimated_cost || 0);
+      const actualCost = Number(form.actual_cost || 0);
+      if (!Number.isFinite(estimatedCost) || estimatedCost < 0 || !Number.isFinite(actualCost) || actualCost < 0) {
         throw new Error("COST");
       }
 
-      let currentRequest: { resident_id: string | null; room_id: string | null; assigned_date: string | null; completed_at: string | null } | null = null;
+      let currentRequest: CurrentMaintenanceRequest | null = null;
       if (editingId) {
-        const current = await supabase.from("maintenance_requests").select("id,status,resident_id,room_id,assigned_date,completed_at").eq("id", editingId).maybeSingle();
+        const current = await supabase.from("maintenance_requests").select("id,status,resident_id,admission_id,room_id,bed_id,assigned_date,completion_date,completed_at").eq("id", editingId).maybeSingle();
         if (current.error || !current.data) throw new Error("STALE");
-        currentRequest = current.data as { resident_id: string | null; room_id: string | null; assigned_date: string | null; completed_at: string | null };
+        const snapshot = requests.find((request) => request.id === editingId);
+        if (current.data.status === "Archived" || !snapshot || current.data.status !== snapshot.status) throw new Error("STALE");
+        currentRequest = current.data as CurrentMaintenanceRequest;
       }
 
-      if (form.resident_id) {
-        const resident = await supabase.from("residents").select("id,status").eq("id", form.resident_id).maybeSingle();
+      const residentId = currentRequest?.resident_id ?? (form.resident_id || null);
+      const admissionId = currentRequest?.admission_id ?? (form.admission_id || null);
+      const roomId = currentRequest?.room_id ?? form.room_id;
+      const bedId = currentRequest?.bed_id ?? (form.bed_id || null);
+
+      const [roomResult, bedResult, admissionResult] = await Promise.all([
+        supabase.from("rooms").select("id").eq("id", roomId).maybeSingle(),
+        bedId ? supabase.from("beds").select("id,room_id").eq("id", bedId).maybeSingle() : Promise.resolve({ data: null, error: null }),
+        admissionId ? supabase.from("admissions").select("id,resident_id,room_id,bed_id").eq("id", admissionId).maybeSingle() : Promise.resolve({ data: null, error: null }),
+      ]);
+      if (roomResult.error || !roomResult.data) throw new Error("ROOM");
+      if (bedResult.error || (bedId && (!bedResult.data || text(bedResult.data.room_id) !== roomId))) throw new Error("BED");
+      if (admissionResult.error || (admissionId && (!admissionResult.data || text(admissionResult.data.room_id) !== roomId || (residentId && text(admissionResult.data.resident_id) !== residentId) || (bedId && text(admissionResult.data.bed_id) !== bedId)))) throw new Error("RELATIONSHIP");
+
+      if (residentId) {
+        const resident = await supabase.from("residents").select("id,status").eq("id", residentId).maybeSingle();
         if (resident.error || !resident.data || (!editingId && text(resident.data.status).trim().toLowerCase() === "archived")) throw new Error("RESIDENT");
-        const relationshipUnchanged = currentRequest?.resident_id === form.resident_id && currentRequest?.room_id === form.room_id;
-        const validAdmission = admissions.some((admission) => text(admission.resident_id) === form.resident_id && text(admission.room_id) === form.room_id && text(admission.status).trim().toLowerCase() === "active");
-        if (!relationshipUnchanged && !validAdmission) throw new Error("RELATIONSHIP");
       }
 
       const finalCompletionDate =
-        form.status === "Completed"
-          ? form.completion_date ||
-            new Date().toISOString().slice(0, 10)
-          : form.completion_date || null;
+        form.completion_date ||
+        currentRequest?.completion_date ||
+        (form.status === "Completed" ? new Date().toISOString().slice(0, 10) : null);
 
       const payload = {
-        resident_id: form.resident_id || null,
-        room_id: form.room_id || null,
+        resident_id: residentId,
+        admission_id: admissionId,
+        room_id: roomId,
+        bed_id: bedId,
         title: form.title.trim(),
         category: form.category,
         description: form.description.trim() || null,
         priority: form.priority,
         status: form.status,
         assigned_to: form.assigned_to.trim() || null,
-        estimated_cost: Number(form.estimated_cost) || 0,
-        actual_cost: Number(form.actual_cost) || 0,
+        estimated_cost: estimatedCost,
+        actual_cost: actualCost,
+        complaint_date: form.reported_date,
         photo_url: existingPhoto,
         assigned_date:
           currentRequest?.assigned_date ||
@@ -434,17 +487,21 @@ export default function MaintenancePage() {
         updated_at: new Date().toISOString(),
       };
 
-      const result = editingId
-        ? await supabase
-            .from("maintenance_requests")
-            .update(payload)
-            .eq("id", editingId)
-            .select("*")
-            .single()
-        : await supabase.from("maintenance_requests").insert({
+      let result;
+      if (editingId && currentRequest) {
+        result = await supabase
+          .from("maintenance_requests")
+          .update(payload)
+          .eq("id", editingId)
+          .eq("status", currentRequest.status)
+          .select("*")
+          .single();
+      } else {
+        result = await supabase.from("maintenance_requests").insert({
             ...payload,
             request_number: requestNumber(),
           }).select("*").single();
+      }
 
       if (result.error || !result.data) {
         throw new Error("DATABASE");
@@ -473,7 +530,7 @@ export default function MaintenancePage() {
           before_photos: beforePhotos,
           during_photos: duringPhotos,
           after_photos: afterPhotos,
-          photo_url: existingPhoto || beforePhotos[0] || null,
+        photo_url: existingPhoto || beforePhotos[0] || null,
           updated_at: new Date().toISOString(),
         }).eq("id", saved.id);
 
@@ -499,10 +556,12 @@ export default function MaintenancePage() {
       const code = saveError instanceof Error ? saveError.message : "";
       const messages: Record<string, string> = {
         PHOTO_UPLOAD: "The maintenance photo could not be uploaded. The request was not changed.",
-        COST: "Estimated and actual costs cannot be negative.",
+        COST: "Estimated and actual costs must be valid non-negative amounts.",
         STALE: "This maintenance request no longer exists. Please refresh and try again.",
         RESIDENT: "The selected resident is no longer available for a new maintenance request.",
-        RELATIONSHIP: "The selected resident is not currently assigned to the selected room.",
+        ROOM: "The selected room could not be verified.",
+        BED: "The selected bed does not belong to the selected room.",
+        RELATIONSHIP: "The selected admission, resident, room, and bed relationship does not match.",
         DATABASE: "The maintenance request could not be saved. Please review the form and try again.",
       };
       setError(messages[code] || "The maintenance request could not be saved. Please try again.");
@@ -526,21 +585,48 @@ export default function MaintenancePage() {
       setError("This maintenance request could not be refreshed. Please try again.");
       return;
     }
-    if (text(current.data.status).trim().toLowerCase() === "cancelled") {
-      setError("This maintenance request is already cancelled.");
+    if (["cancelled", "archived"].includes(text(current.data.status).trim().toLowerCase())) {
+      setError("This maintenance request is already cancelled or archived.");
       return;
     }
-    const { error: cancelError } = await supabase
+    const { data: cancelled, error: cancelError } = await supabase
       .from("maintenance_requests")
       .update({ status: "Cancelled", updated_at: new Date().toISOString() })
-      .eq("id", request.id);
+      .eq("id", request.id)
+      .eq("status", current.data.status)
+      .select("id")
+      .maybeSingle();
 
-    if (cancelError) {
-      setError(getSupabaseErrorMessage(cancelError, "The maintenance request could not be cancelled. Please try again."));
+    if (cancelError || !cancelled) {
+      setError(cancelError ? getSupabaseErrorMessage(cancelError, "The maintenance request could not be cancelled. Please try again.") : "The maintenance status changed before cancellation completed. Refresh and try again.");
     } else {
       setMessage("Maintenance request cancelled. Its history has been preserved.");
       await refresh();
     }
+  }
+
+  async function archiveRequest(request: MaintenanceRequest) {
+    if (!window.confirm(`Archive maintenance request ${request.request_number}? Its full record and evidence will remain preserved.`)) return;
+    setMessage("");
+    setError("");
+    const current = await supabase.from("maintenance_requests").select("id,status").eq("id", request.id).maybeSingle();
+    if (current.error || !current.data) {
+      setError("This maintenance request could not be refreshed. Please try again.");
+      return;
+    }
+    if (current.data.status === "Archived") {
+      setError("This maintenance request is already archived.");
+      return;
+    }
+    const { data: archived, error: archiveError } = await supabase.from("maintenance_requests").update({ status: "Archived", updated_at: new Date().toISOString() }).eq("id", request.id).eq("status", current.data.status).select("id").maybeSingle();
+    if (archiveError || !archived) {
+      setError(archiveError ? getSupabaseErrorMessage(archiveError, "The maintenance request could not be archived.") : "The maintenance status changed before archival completed. Refresh and try again.");
+      await refresh();
+      return;
+    }
+    if (editingId === request.id) { resetForm(); setShowForm(false); }
+    setMessage("Maintenance request archived. Its history and evidence were preserved.");
+    await refresh();
   }
 
   function handlePhoto(event: ChangeEvent<HTMLInputElement>) {
@@ -558,6 +644,11 @@ export default function MaintenancePage() {
     kind: "before" | "during" | "after"
   ) {
     const files = Array.from(event.target.files ?? []);
+    if (files.length > MAX_FILES_PER_CATEGORY) {
+      setError(`Choose no more than ${MAX_FILES_PER_CATEGORY} photos at a time.`);
+      event.target.value = "";
+      return;
+    }
     const validationError = files.map(validateImageFile).find(Boolean);
     if (validationError) {
       setError(validationError);
@@ -640,10 +731,9 @@ export default function MaintenancePage() {
               <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-3">
                 <Field label="Resident">
                   <select
+                    disabled={Boolean(editingId)}
                     value={form.resident_id}
-                    onChange={(event) =>
-                      updateField("resident_id", event.target.value)
-                    }
+                    onChange={(event) => setForm((current) => ({ ...current, resident_id: event.target.value, admission_id: "", bed_id: "" }))}
                     className={inputClass}
                   >
                     <option value="">No resident selected</option>
@@ -664,31 +754,49 @@ export default function MaintenancePage() {
                   </select>
                 </Field>
 
-                <Field label="Room">
+                <Field label="Admission">
                   <select
-                    value={form.room_id}
-                    onChange={(event) =>
-                      updateField("room_id", event.target.value)
-                    }
+                    disabled={Boolean(editingId)}
+                    value={form.admission_id}
+                    onChange={(event) => {
+                      const admission = admissions.find((item) => text(item.id) === event.target.value);
+                      setForm((current) => ({
+                        ...current,
+                        admission_id: event.target.value,
+                        resident_id: admission ? text(admission.resident_id) : current.resident_id,
+                        room_id: admission ? text(admission.room_id) : current.room_id,
+                        bed_id: admission ? text(admission.bed_id) : "",
+                      }));
+                    }}
                     className={inputClass}
                   >
-                    <option value="">No room selected</option>
+                    <option value="">No admission selected</option>
+                    {admissions.filter((admission) => !form.resident_id || text(admission.resident_id) === form.resident_id || text(admission.id) === form.admission_id).map((admission) => <option key={text(admission.id)} value={text(admission.id)}>{text(admission.admission_date).slice(0, 10) || text(admission.id)} · {text(admission.status)}</option>)}
+                  </select>
+                </Field>
 
-                    {rooms
-                      .filter((room) => {
-                        if (!form.resident_id) return true;
-                        if (text(room.id) === form.room_id) return true;
-                        return admissions.some((admission) =>
-                          text(admission.resident_id) === form.resident_id &&
-                          text(admission.room_id) === text(room.id) &&
-                          text(admission.status).trim().toLowerCase() === "active"
-                        );
-                      })
-                      .map((room) => (
+                <Field label="Room *">
+                  <select
+                    required
+                    disabled={Boolean(editingId)}
+                    value={form.room_id}
+                    onChange={(event) => setForm((current) => ({ ...current, room_id: event.target.value, admission_id: "", bed_id: "" }))}
+                    className={inputClass}
+                  >
+                    <option value="">Select room</option>
+
+                    {rooms.map((room) => (
                       <option key={text(room.id)} value={text(room.id)}>
                         {roomNumber(room)}
                       </option>
                     ))}
+                  </select>
+                </Field>
+
+                <Field label="Bed">
+                  <select disabled={Boolean(editingId) || !form.room_id} value={form.bed_id} onChange={(event) => updateField("bed_id", event.target.value)} className={inputClass}>
+                    <option value="">No bed selected</option>
+                    {beds.filter((bed) => text(bed.room_id) === form.room_id).map((bed) => <option key={text(bed.id)} value={text(bed.id)}>{firstText(bed, ["bed_number", "name"]) || text(bed.id)}</option>)}
                   </select>
                 </Field>
 
@@ -751,21 +859,22 @@ export default function MaintenancePage() {
                     }
                     className={inputClass}
                   >
-                    <option value="Pending">Pending</option>
+                    <option value="Open">Open</option>
+                    {(form.status === "Pending" || requests.some((request) => request.status === "Pending")) && <option value="Pending">Pending (Legacy)</option>}
                     <option value="In Progress">In Progress</option>
                     <option value="Completed">Completed</option>
                     <option value="Cancelled">Cancelled</option>
                   </select>
                 </Field>
 
-                <Field label="Assigned Staff / Technician">
+                <Field label="Assigned Person / Vendor">
                   <input
                     value={form.assigned_to}
                     onChange={(event) =>
                       updateField("assigned_to", event.target.value)
                     }
                     className={inputClass}
-                    placeholder="Technician name"
+                    placeholder="Staff, technician, or vendor name"
                   />
                 </Field>
 
@@ -821,7 +930,7 @@ export default function MaintenancePage() {
 
                   {existingPhoto && !photoFile && (
                     <a
-                      href={existingPhoto}
+                      href={maintenancePhotoUrl(existingPhoto)}
                       target="_blank"
                       rel="noreferrer"
                       className="mt-2 inline-block text-xs font-semibold text-indigo-700"
@@ -829,6 +938,10 @@ export default function MaintenancePage() {
                       Open current photo
                     </a>
                   )}
+                </Field>
+
+                <Field label="Reported Date *">
+                  <input required type="date" value={form.reported_date} onChange={(event) => updateField("reported_date", event.target.value)} className={inputClass} />
                 </Field>
 
                 <Field label="Additional Before Photos">
@@ -845,9 +958,9 @@ export default function MaintenancePage() {
 
                 {editingId && (
                   <div className="md:col-span-2 xl:col-span-3">
-                    <MaintenancePhotoLinks title="Existing before photos" urls={photoList(requests.find((item) => item.id === editingId)?.before_photos)} />
-                    <MaintenancePhotoLinks title="Existing during photos" urls={photoList(requests.find((item) => item.id === editingId)?.during_photos)} />
-                    <MaintenancePhotoLinks title="Existing after photos" urls={photoList(requests.find((item) => item.id === editingId)?.after_photos)} />
+                    <MaintenancePhotoLinks title="Existing before photos" urls={photoUrls(requests.find((item) => item.id === editingId)?.before_photos)} />
+                    <MaintenancePhotoLinks title="Existing during photos" urls={photoUrls(requests.find((item) => item.id === editingId)?.during_photos)} />
+                    <MaintenancePhotoLinks title="Existing after photos" urls={photoUrls(requests.find((item) => item.id === editingId)?.after_photos)} />
                   </div>
                 )}
 
@@ -964,11 +1077,14 @@ export default function MaintenancePage() {
               }
               className={inputClass}
             >
+              <option value="Current">Current</option>
               <option value="All">All Statuses</option>
-              <option value="Pending">Pending</option>
+              <option value="Open">Open</option>
+              <option value="Pending">Pending (Legacy)</option>
               <option value="In Progress">In Progress</option>
               <option value="Completed">Completed</option>
               <option value="Cancelled">Cancelled</option>
+              <option value="Archived">Archived</option>
             </select>
 
             <button
@@ -985,12 +1101,12 @@ export default function MaintenancePage() {
               <thead className="bg-slate-50">
                 <tr>
                   {[
-                    "Request",
-                    "Resident / Room",
-                    "Issue",
-                    "Assignment",
-                    "Cost",
-                    "Photo",
+                    "Request / Dates",
+                    "Room / Bed",
+                    "Resident",
+                    "Issue / Assignment",
+                    "Costs",
+                    "Evidence",
                     "Status",
                     "Actions",
                   ].map((heading) => (
@@ -1033,6 +1149,10 @@ export default function MaintenancePage() {
                     const room = rooms.find(
                       (item) => text(item.id) === request.room_id
                     );
+                    const bed = beds.find(
+                      (item) => text(item.id) === request.bed_id
+                    );
+                    const archived = request.status === "Archived";
 
                     return (
                       <tr
@@ -1044,15 +1164,22 @@ export default function MaintenancePage() {
                             {request.request_number}
                           </p>
                           <p className="mt-1 text-xs text-slate-500">
-                            {request.created_at.slice(0, 10)}
+                            Reported: {(request.complaint_date || request.created_at).slice(0, 10)}
+                          </p>
+                          <p className="mt-1 text-xs text-slate-500">
+                            Completed: {request.completion_date || "—"}
                           </p>
                         </td>
 
                         <td className="px-5 py-4 text-sm text-slate-700">
-                          <p>{residentName(resident)}</p>
+                          <p>Room: {roomNumber(room)}</p>
                           <p className="mt-1 text-xs text-slate-500">
-                            Room: {roomNumber(room)}
+                            Bed: {firstText(bed, ["bed_number", "name"]) || "Not linked"}
                           </p>
+                        </td>
+
+                        <td className="px-5 py-4 text-sm text-slate-700">
+                          {residentName(resident)}
                         </td>
 
                         <td className="px-5 py-4">
@@ -1062,6 +1189,9 @@ export default function MaintenancePage() {
                           <p className="mt-1 text-xs text-slate-500">
                             {request.category}
                           </p>
+                          <p className="mt-1 text-xs text-slate-500">
+                            Assigned: {request.assigned_to || "Not assigned"}
+                          </p>
                           <span
                             className={`mt-2 inline-flex rounded-full px-3 py-1 text-xs font-bold ${priorityClass(
                               request.priority
@@ -1069,10 +1199,6 @@ export default function MaintenancePage() {
                           >
                             {request.priority}
                           </span>
-                        </td>
-
-                        <td className="px-5 py-4 text-sm text-slate-700">
-                          {request.assigned_to || "Not assigned"}
                         </td>
 
                         <td className="px-5 py-4 text-xs text-slate-600">
@@ -1107,24 +1233,24 @@ export default function MaintenancePage() {
                         <td className="px-5 py-4">
                           <div className="flex flex-wrap gap-2">
                             <Link href={`/maintenance/${request.id}`} className="rounded-lg border border-slate-300 px-3 py-2 text-xs font-semibold text-slate-700">View</Link>
-                            <button
+                            {!archived && <button
                               type="button"
                               onClick={() => openEditForm(request)}
                               className="rounded-lg border border-indigo-200 px-3 py-2 text-xs font-semibold text-indigo-700"
                             >
                               Edit
-                            </button>
+                            </button>}
 
-                            <button
+                            {!archived && request.status !== "Cancelled" && <button
                               type="button"
                               onClick={() =>
                                 void cancelRequest(request)
                               }
-                              disabled={request.status === "Cancelled"}
-                              className="rounded-lg border border-slate-300 px-3 py-2 text-xs font-semibold text-slate-700 disabled:opacity-50"
+                              className="rounded-lg border border-slate-300 px-3 py-2 text-xs font-semibold text-slate-700"
                             >
                               Cancel
-                            </button>
+                            </button>}
+                            {!archived && <button type="button" onClick={() => void archiveRequest(request)} className="rounded-lg border border-amber-200 px-3 py-2 text-xs font-semibold text-amber-700">Archive</button>}
                           </div>
                         </td>
                       </tr>

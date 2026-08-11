@@ -2,13 +2,12 @@
 
 import Link from "next/link";
 import { useCallback, useEffect, useMemo, useState } from "react";
-import { supabase } from "@/lib/supabase";
 import {
   resolveAuthenticatedResident,
   type AuthenticatedResident,
 } from "@/lib/residentPortalAuth";
+import { loadResidentPortalData } from "@/lib/residentPortalData";
 import { deriveBillStatus, roundMoney } from "@/lib/financials";
-import { getSupabaseErrorMessage } from "@/lib/supabaseErrors";
 
 type BillStatus =
   | "Pending"
@@ -93,27 +92,17 @@ export default function ResidentBillsPage() {
       return;
     }
 
-    const residentId = resolved.resident.id;
-    const [billsResult, paymentsResult] = await Promise.all([
-      supabase
-        .from("bills")
-        .select("*")
-        .eq("resident_id", residentId)
-        .order("billing_month", { ascending: false }),
-      supabase
-        .from("payments")
-        .select("bill_id, amount, payment_status")
-        .eq("resident_id", residentId),
-    ]);
-
-    const loadError = billsResult.error || paymentsResult.error;
-    if (loadError) {
-      setError(getSupabaseErrorMessage(loadError, "Your bills could not be loaded. Please try again."));
+    const portalResult = await loadResidentPortalData();
+    if (
+      !portalResult.data ||
+      portalResult.data.resident.id !== resolved.resident.id
+    ) {
+      setError(portalResult.error || "Your resident account could not be verified.");
       setLoading(false);
       return;
     }
 
-    const payments = (paymentsResult.data ?? []) as Payment[];
+    const payments = portalResult.data.payments as Payment[];
     const verifiedByBill = new Map<string, number>();
     for (const payment of payments) {
       if (normalized(payment.payment_status) !== "verified") continue;
@@ -123,7 +112,7 @@ export default function ResidentBillsPage() {
       );
     }
 
-    const calculatedBills = ((billsResult.data ?? []) as Bill[]).map((bill) => {
+    const calculatedBills = (portalResult.data.bills as Bill[]).map((bill) => {
       const paid = verifiedByBill.get(bill.id) ?? 0;
       const total = Number(bill.total_amount || 0);
       const cancelled = normalized(bill.bill_status) === "cancelled";
@@ -137,7 +126,7 @@ export default function ResidentBillsPage() {
       } as Bill;
     });
 
-    setResident(resolved.resident);
+    setResident(portalResult.data.resident);
     setBills(calculatedBills);
     setLoading(false);
   }, []);
@@ -160,35 +149,28 @@ export default function ResidentBillsPage() {
   }, [bills, search, statusFilter]);
 
   async function openBill(billId: string, print = false) {
-    const resolved = await resolveAuthenticatedResident();
-    if (!resolved.resident) {
-      setError(resolved.error ?? "Your resident profile could not be verified.");
+    const portalResult = await loadResidentPortalData();
+    if (!portalResult.data) {
+      setError(portalResult.error);
       return;
     }
 
-    const [billResult, paymentsResult] = await Promise.all([
-      supabase
-        .from("bills")
-        .select("*")
-        .eq("id", billId)
-        .eq("resident_id", resolved.resident.id)
-        .maybeSingle(),
-      supabase
-        .from("payments")
-        .select("amount")
-        .eq("bill_id", billId)
-        .eq("resident_id", resolved.resident.id)
-        .eq("payment_status", "Verified"),
-    ]);
-
-    if (billResult.error || paymentsResult.error || !billResult.data) {
+    const currentBill = (portalResult.data.bills as Bill[]).find(
+      (bill) => bill.id === billId,
+    );
+    if (!currentBill) {
       setError("This bill could not be opened. Refresh and try again.");
       return;
     }
 
-    const currentBill = billResult.data as Bill;
     const paid = roundMoney(
-      (paymentsResult.data ?? []).reduce(
+      (portalResult.data.payments as Payment[])
+        .filter(
+          (payment) =>
+            payment.bill_id === billId &&
+            normalized(payment.payment_status) === "verified",
+        )
+        .reduce(
         (sum, payment) => sum + Number(payment.amount || 0),
         0,
       ),

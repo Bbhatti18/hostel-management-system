@@ -27,6 +27,7 @@ const adminRoutes = [
 ];
 
 const residentPortalPath = "/resident-portal";
+const residentPortalDataPath = "/api/resident-portal/data";
 const loginPath = "/login";
 
 function isAdminRoute(pathname: string) {
@@ -87,11 +88,14 @@ async function getUserRole(supabase: SupabaseClient, email: string | undefined) 
 
   const { data: staffUser } = await supabase
     .from("staff_users")
-    .select("email")
+    .select("email, role")
     .ilike("email", normalizedEmail)
     .maybeSingle();
 
-  if (staffUser?.email) {
+  if (
+    staffUser?.email &&
+    String(staffUser.role ?? "").trim().toLowerCase() === "admin"
+  ) {
     return "staff" as const;
   }
 
@@ -110,7 +114,7 @@ export async function proxy(request: NextRequest) {
   const { pathname } = request.nextUrl;
   const response = NextResponse.next();
 
-  if (pathname === loginPath) {
+  if (pathname === loginPath || pathname === residentPortalDataPath) {
     return response;
   }
 
