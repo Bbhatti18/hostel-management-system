@@ -2,6 +2,7 @@ import { NextRequest, NextResponse } from "next/server";
 import { createClient } from "@supabase/supabase-js";
 import { supabaseAdmin } from "@/lib/supabaseAdmin";
 import { notifyResidentEvent } from "@/lib/notifications/server";
+import { securityDepositAdmissionId } from "@/lib/paymentReceiptPurpose";
 
 const ALLOWED_STAFF_ROLES = new Set([
   "super admin",
@@ -128,6 +129,9 @@ export async function POST(request: NextRequest) {
     if (receiptError || !receipt) {
       return jsonError("The receipt could not be verified.", 404);
     }
+    const depositAdmissionId = receipt.bill_id
+      ? null
+      : securityDepositAdmissionId(receipt.notes);
 
     const { data: linkedPayments, error: linkedPaymentError } =
       await supabaseAdmin
@@ -152,7 +156,7 @@ export async function POST(request: NextRequest) {
       if (
         action === "Verify" &&
         receipt.status === "Verified" &&
-        existingPayment?.payment_status === "Verified"
+        (depositAdmissionId || existingPayment?.payment_status === "Verified")
       ) {
         return NextResponse.json(
           { message: "This receipt was already verified.", alreadyProcessed: true },
@@ -222,7 +226,100 @@ export async function POST(request: NextRequest) {
       );
       return NextResponse.json(
         {
-          message: "Receipt rejected. No amount was applied to the bill.",
+          message: depositAdmissionId
+            ? "Security deposit receipt rejected. The admission deposit remains Pending."
+            : "Receipt rejected. No amount was applied to the bill.",
+          notificationWarning: notification.warning,
+        },
+        { headers: { "Cache-Control": "private, no-store" } },
+      );
+    }
+
+    if (depositAdmissionId) {
+      if (receipt.bill_id || existingPayment) {
+        return jsonError(
+          "This security deposit receipt is incorrectly linked to a bill or payment.",
+          409,
+        );
+      }
+
+      const { data: admission, error: admissionError } = await supabaseAdmin
+        .from("admissions")
+        .select("id, resident_id, status, security_deposit, deposit_status")
+        .eq("id", depositAdmissionId)
+        .maybeSingle();
+      const receiptAmount = roundMoney(Number(receipt.amount ?? 0));
+      const depositAmount = roundMoney(Number(admission?.security_deposit ?? 0));
+      if (
+        admissionError ||
+        !admission ||
+        admission.resident_id !== receipt.resident_id ||
+        admission.status !== "Pending" ||
+        admission.deposit_status !== "Pending" ||
+        depositAmount <= 0 ||
+        receiptAmount !== depositAmount
+      ) {
+        return jsonError(
+          "This receipt no longer matches an outstanding security deposit for the resident's Pending admission.",
+          409,
+        );
+      }
+
+      const verifiedAt = new Date().toISOString();
+      const { data: claimedReceipt, error: claimError } = await supabaseAdmin
+        .from("payment_receipts")
+        .update({
+          status: "Verified",
+          verified: true,
+          verified_by: verifier,
+          verified_at: verifiedAt,
+          updated_at: verifiedAt,
+        })
+        .eq("id", receipt.id)
+        .eq("resident_id", receipt.resident_id)
+        .eq("status", "Pending Verification")
+        .select("id")
+        .maybeSingle();
+      if (claimError || !claimedReceipt) {
+        return jsonError(
+          "The receipt changed before verification completed. Refresh and review its current status.",
+          409,
+        );
+      }
+
+      const { data: receivedDeposit, error: depositError } = await supabaseAdmin
+        .from("admissions")
+        .update({ deposit_status: "Received", updated_at: verifiedAt })
+        .eq("id", admission.id)
+        .eq("resident_id", receipt.resident_id)
+        .eq("status", "Pending")
+        .eq("deposit_status", "Pending")
+        .eq("security_deposit", admission.security_deposit)
+        .select("id")
+        .maybeSingle();
+      if (depositError || !receivedDeposit) {
+        await supabaseAdmin
+          .from("payment_receipts")
+          .update({
+            status: "Pending Verification",
+            verified: false,
+            verified_by: null,
+            verified_at: null,
+            updated_at: new Date().toISOString(),
+          })
+          .eq("id", receipt.id)
+          .eq("status", "Verified")
+          .eq("verified_at", verifiedAt);
+        return jsonError(
+          "The admission changed during verification. The receipt remains pending; refresh and try again.",
+          409,
+        );
+      }
+
+      const notification = await notifyResidentEvent("payment_verified", receipt.id);
+      return NextResponse.json(
+        {
+          message: "Security deposit receipt verified. The deposit is Received; the admission remains Pending until explicit activation.",
           notificationWarning: notification.warning,
         },
         { headers: { "Cache-Control": "private, no-store" } },

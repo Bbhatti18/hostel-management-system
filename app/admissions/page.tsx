@@ -28,6 +28,7 @@ import {
 import {
   ALLOCATABLE_BED_STATUSES,
   BED_STATUS,
+  RESIDENT_STATUS,
   isAllocatableBedStatus,
 } from "@/lib/statuses";
 
@@ -505,7 +506,7 @@ export default function AdmissionsPage() {
       expected_leaving_date: form.expected_leaving_date || null,
       monthly_rent: Number(form.monthly_rent) || 0,
       security_deposit: Number(form.security_deposit) || 0,
-      deposit_status: form.deposit_status,
+      deposit_status: previousAdmission.deposit_status,
       notice_period_days: Number(form.notice_period_days) || 30,
       status: nextStatus,
       notes: form.notes.trim() || null,
@@ -631,20 +632,6 @@ export default function AdmissionsPage() {
         setSaving(false);
         return;
       }
-    }
-    const currentContract = contracts.find(
-      (item) => item.admission_id === editingId,
-    );
-
-    const shouldAutoActivate =
-      previousAdmission.status === "Pending" &&
-      isAdmissionReadyForActivation(form.deposit_status, currentContract);
-
-    if (shouldAutoActivate) {
-      closeEditForm();
-      setSaving(false);
-      await activateAdmission(editingId);
-      return;
     }
     setMessage("Admission updated successfully.");
     closeEditForm();
@@ -857,6 +844,48 @@ export default function AdmissionsPage() {
         );
       }
 
+      let residentActivation = supabase
+        .from("residents")
+        .update({
+          status: RESIDENT_STATUS.ACTIVE,
+          updated_at: new Date().toISOString(),
+        })
+        .eq("id", context.admission.resident_id);
+      residentActivation = context.resident.status
+        ? residentActivation.eq("status", context.resident.status)
+        : residentActivation.is("status", null);
+      const { data: activatedResident, error: residentActivateError } =
+        await residentActivation.select("id").maybeSingle();
+      if (residentActivateError || !activatedResident) {
+        const [{ data: rolledBackAdmission }, { data: rolledBackContract }] =
+          await Promise.all([
+            supabase
+              .from("admissions")
+              .update({ status: "Pending", updated_at: new Date().toISOString() })
+              .eq("id", admissionId)
+              .eq("status", "Active")
+              .select("id")
+              .maybeSingle(),
+            supabase
+              .from("contracts")
+              .update({
+                status: previousContractStatus,
+                contract_status: previousLegacyContractStatus,
+                updated_at: new Date().toISOString(),
+              })
+              .eq("id", context.contract.id)
+              .eq("status", "Active")
+              .eq("contract_status", "Active")
+              .select("id")
+              .maybeSingle(),
+          ]);
+        throw new Error(
+          rolledBackAdmission && rolledBackContract
+            ? "The resident operational status could not be activated, so the admission and contract were returned to Pending."
+            : "The resident operational status could not be activated and the lifecycle rollback was incomplete. Please contact an administrator.",
+        );
+      }
+
       setMessage("Contract and deposit verified. Admission activated successfully.");
       await refresh();
       setAdmissionDataVersion((current) => current + 1);
@@ -990,26 +1019,14 @@ export default function AdmissionsPage() {
         );
       }
 
-      if (admission.deposit_status === "Received") {
-        await activateAdmission(admissionId);
-        const notificationResult = await requestEventNotification(
-          "contract_approved",
-          currentContract.id,
-        );
-        if (notificationResult.warning) {
-          setMessage((current) =>
-            `${current || "Resident signature approved."}${notificationWarning(notificationResult)}`,
-          );
-        }
-        return;
-      }
-
       const notificationResult = await requestEventNotification(
         "contract_approved",
         currentContract.id,
       );
       setMessage(
-        `Resident signature approved. Admission remains Pending until the security deposit is received.${notificationWarning(notificationResult)}`,
+        admission.deposit_status === "Received"
+          ? `Resident signature approved. Admission is ready when its allocation is valid; use Activate Admission as a separate admin action.${notificationWarning(notificationResult)}`
+          : `Resident signature approved. Admission remains Pending until the security deposit receipt is verified, then requires separate admin activation.${notificationWarning(notificationResult)}`,
       );
       await refresh();
       setAdmissionDataVersion((current) => current + 1);
@@ -1018,109 +1035,6 @@ export default function AdmissionsPage() {
         approvalError instanceof Error
           ? approvalError.message
           : "Unable to approve the resident signature.",
-      );
-      await refresh();
-      setAdmissionDataVersion((current) => current + 1);
-    } finally {
-      setLifecycleActionId(null);
-    }
-  }
-
-  async function receiveDepositFromAdmission(admission: Admission) {
-    const confirmed = window.confirm(
-      `Mark the security deposit of ${money(
-        admission.security_deposit,
-      )} as Received for this admission?`,
-    );
-    if (!confirmed) return;
-
-    setLifecycleActionId(admission.id);
-    setMessage("");
-    setError("");
-
-    try {
-      const { data: currentAdmission, error: admissionError } = await supabase
-        .from("admissions")
-        .select("id, status, deposit_status")
-        .eq("id", admission.id)
-        .maybeSingle();
-
-      if (admissionError || !currentAdmission) {
-        throw new Error(
-          admissionError
-            ? getSupabaseErrorMessage(
-                admissionError,
-                "Unable to verify this admission.",
-              )
-            : "The admission could not be found.",
-        );
-      }
-
-      if (currentAdmission.status !== "Pending") {
-        throw new Error(
-          "Only a Pending admission can have its deposit received from this action.",
-        );
-      }
-
-      if (currentAdmission.deposit_status !== "Received") {
-        const { data: received, error: receiveError } = await supabase
-          .from("admissions")
-          .update({
-            deposit_status: "Received",
-            updated_at: new Date().toISOString(),
-          })
-          .eq("id", admission.id)
-          .eq("status", "Pending")
-          .eq("deposit_status", currentAdmission.deposit_status)
-          .select("id")
-          .maybeSingle();
-
-        if (receiveError || !received) {
-          throw new Error(
-            receiveError
-              ? getSupabaseErrorMessage(
-                  receiveError,
-                  "Unable to mark the security deposit as received.",
-                )
-              : "The admission changed before the deposit update completed. Refresh and try again.",
-          );
-        }
-      }
-
-      const { data: currentContract, error: contractError } = await supabase
-        .from("contracts")
-        .select(
-          "id, admission_id, status, contract_status, resident_signature, resident_signature_url, resident_signature_status, signed_by_resident, signed_at, contract_content, terms",
-        )
-        .eq("admission_id", admission.id)
-        .order("created_at", { ascending: false })
-        .limit(1)
-        .maybeSingle();
-
-      if (contractError) {
-        throw new Error(
-          getSupabaseErrorMessage(
-            contractError,
-            "Deposit was received, but the contract could not be verified.",
-          ),
-        );
-      }
-
-      if (isContractSignedAndAccepted(currentContract as AdmissionContract | null)) {
-        await activateAdmission(admission.id);
-        return;
-      }
-
-      setMessage(
-        "Security deposit received. Admission remains Pending until the resident signature is approved.",
-      );
-      await refresh();
-      setAdmissionDataVersion((current) => current + 1);
-    } catch (depositError) {
-      setError(
-        depositError instanceof Error
-          ? depositError.message
-          : "Unable to receive the security deposit.",
       );
       await refresh();
       setAdmissionDataVersion((current) => current + 1);
@@ -1500,22 +1414,12 @@ export default function AdmissionsPage() {
                 </Field>
 
                 <Field label="Deposit Status">
-                  <select
+                  <input
                     value={form.deposit_status}
-                    onChange={(event) =>
-                      updateField(
-                        "deposit_status",
-                        event.target.value as DepositStatus
-                      )
-                    }
                     className={inputClass}
-                    disabled={saving}
-                  >
-                    <option value="Pending">Pending</option>
-                    <option value="Received">Received</option>
-                    <option value="Refunded">Refunded</option>
-                    <option value="Forfeited">Forfeited</option>
-                  </select>
+                    disabled
+                    title="Deposit status changes only through receipt verification."
+                  />
                 </Field>
 
                 <Field label="Notice Period (Days)">
@@ -1841,18 +1745,13 @@ const depositVerified = isDepositVerified(
 
                               {admission.status === "Pending" &&
                                 !depositVerified && (
-                                  <button
-                                    type="button"
-                                    onClick={() =>
-                                      void receiveDepositFromAdmission(admission)
-                                    }
-                                    disabled={isLifecycleAction || isArchiving}
-                                    className="rounded-lg border border-emerald-200 px-3 py-2 text-xs font-semibold text-emerald-700 transition hover:bg-emerald-50 disabled:cursor-not-allowed disabled:opacity-60"
+                                  <Link
+                                    href="/payment-verification"
+                                    className="rounded-lg border border-amber-200 px-3 py-2 text-xs font-semibold text-amber-700 transition hover:bg-amber-50"
+                                    title="The resident must submit payment evidence through the portal before verification."
                                   >
-                                    {isLifecycleAction
-                                      ? "Working..."
-                                      : "Receive Deposit"}
-                                  </button>
+                                    Review Deposit Receipts
+                                  </Link>
                                 )}
 
                               {admission.status === "Pending" &&

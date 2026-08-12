@@ -1,6 +1,7 @@
 import "server-only";
 
 import { supabaseAdmin } from "@/lib/supabaseAdmin";
+import { securityDepositAdmissionId } from "@/lib/paymentReceiptPurpose";
 import type { NotificationEventType, NotificationRequestResult } from "@/lib/notifications/types";
 
 type Row = Record<string, unknown>;
@@ -140,27 +141,45 @@ async function resolveBill(entityId: string) {
 
 async function resolveReceipt(eventType: "receipt_submitted" | "payment_verified" | "payment_rejected", entityId: string) {
   const { data: receipt, error } = await supabaseAdmin.from("payment_receipts")
-    .select("id, resident_id, bill_id, amount, status, remarks, created_at, updated_at")
+    .select("id, resident_id, bill_id, amount, status, notes, remarks, created_at, updated_at")
     .eq("id", entityId).maybeSingle();
   const expected = eventType === "receipt_submitted" ? "pending verification" : eventType === "payment_verified" ? "verified" : "rejected";
   const eventTime = eventType === "receipt_submitted" ? receipt?.created_at : receipt?.updated_at;
   if (error || !receipt || !recent(eventTime) || normalized(receipt.status) !== expected) throw new Error("event_unavailable");
-  const [{ data: bill }, resident] = await Promise.all([
+  const depositAdmissionId = receipt.bill_id
+    ? null
+    : securityDepositAdmissionId(receipt.notes);
+  const [{ data: bill }, { data: depositAdmission }, resident] = await Promise.all([
     receipt.bill_id ? supabaseAdmin.from("bills").select("bill_number, paid_amount, balance_amount, bill_status").eq("id", receipt.bill_id).maybeSingle() : Promise.resolve({ data: null }),
+    depositAdmissionId ? supabaseAdmin.from("admissions").select("id, resident_id, deposit_status, status").eq("id", depositAdmissionId).maybeSingle() : Promise.resolve({ data: null }),
     loadResident(text(receipt.resident_id)),
   ]);
-  if (!bill) throw new Error("event_unavailable");
+  const isDeposit = Boolean(
+    depositAdmission &&
+    depositAdmission.resident_id === receipt.resident_id &&
+    !receipt.bill_id,
+  );
+  if (!bill && !isDeposit) throw new Error("event_unavailable");
   const name = text(resident.full_name) || "Resident";
-  const billNumber = text(bill.bill_number) || "Bill";
+  const billNumber = isDeposit ? "Security Deposit" : text(bill?.bill_number) || "Bill";
   const amount = money(receipt.amount);
   if (eventType === "receipt_submitted") {
-    return message(eventType, entityId, resident, `Receipt received for ${billNumber}`, [`Receipt received for bill: ${billNumber}`, `Amount: ${amount}`, "Status: Pending Verification", "Your balance will change only after admin verification."], [name, billNumber, amount, "Pending Verification"]);
+    return message(eventType, entityId, resident, `Receipt received for ${billNumber}`, [`Receipt received for: ${billNumber}`, `Amount: ${amount}`, "Status: Pending Verification", "Your balance or deposit status will change only after admin verification."], [name, billNumber, amount, "Pending Verification"]);
   }
   if (eventType === "payment_verified") {
-    const balance = money(bill.balance_amount);
-    const status = text(bill.bill_status) || "Updated";
-    const fullyPaid = Number(bill.balance_amount ?? 0) <= 0 ? "This bill is fully paid." : "A balance remains outstanding.";
-    const values = [name, billNumber, amount, money(bill.paid_amount), balance, status, fullyPaid];
+    if (isDeposit) {
+      const status = text(depositAdmission?.deposit_status) || "Received";
+      const admissionStatus = text(depositAdmission?.status) || "Pending";
+      const state = admissionStatus === "Active"
+        ? "Your admission is Active."
+        : "Your admission remains Pending until an admin explicitly activates it.";
+      const values = [name, billNumber, amount, amount, money(0), status, state];
+      return message(eventType, entityId, resident, "Security Deposit verified", [`Verified deposit: ${amount}`, `Deposit status: ${status}`, `Admission status: ${admissionStatus}`, state], values);
+    }
+    const balance = money(bill?.balance_amount);
+    const status = text(bill?.bill_status) || "Updated";
+    const fullyPaid = Number(bill?.balance_amount ?? 0) <= 0 ? "This bill is fully paid." : "A balance remains outstanding.";
+    const values = [name, billNumber, amount, money(bill?.paid_amount), balance, status, fullyPaid];
     return message(eventType, entityId, resident, `Payment verified for ${billNumber}`, [`Verified amount: ${amount}`, `Updated paid total: ${values[3]}`, `Outstanding: ${balance}`, `Bill status: ${status}`, fullyPaid], values);
   }
   const reason = text(receipt.remarks) || "Please contact hostel administration for details.";

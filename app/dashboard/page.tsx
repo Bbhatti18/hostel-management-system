@@ -10,7 +10,7 @@ import { getSupabaseErrorMessage } from "@/lib/supabaseErrors";
 
 const emptyData: DashboardData = {
   residents: [], admissions: [], contracts: [], bills: [], payments: [],
-  receipts: [], maintenance: [], inspections: [], notices: [],
+  receipts: [], rooms: [], beds: [], maintenance: [], inspections: [], notices: [],
 };
 
 const quickActions = [
@@ -53,7 +53,7 @@ export default function DashboardPage() {
 
     const results = await Promise.all([
       supabase.from("residents").select("id,full_name,resident_code,status,created_at,updated_at").order("created_at", { ascending: false }),
-      supabase.from("admissions").select("id,admission_number,resident_id,status,deposit_status,expected_leaving_date,created_at,updated_at").order("created_at", { ascending: false }),
+      supabase.from("admissions").select("id,admission_number,resident_id,room_id,bed_id,status,deposit_status,expected_leaving_date,created_at,updated_at").order("created_at", { ascending: false }),
       supabase.from("contracts").select("id,contract_number,resident_id,admission_id,status,contract_status,resident_signature,resident_signature_url,resident_signature_status,signed_by_resident,signed_at,contract_content,terms,created_at,updated_at").order("created_at", { ascending: false }),
       supabase.from("bills").select("id,bill_number,resident_id,rent_amount,total_amount,due_date,bill_status,created_at,updated_at").order("created_at", { ascending: false }),
       supabase.from("payments").select("id,payment_number,bill_id,resident_id,amount,payment_status,verified_at,created_at,updated_at").order("created_at", { ascending: false }),
@@ -61,6 +61,8 @@ export default function DashboardPage() {
       supabase.from("maintenance_requests").select("id,request_number,resident_id,title,priority,status,completed_at,created_at,updated_at").order("created_at", { ascending: false }),
       supabase.from("room_inspections").select("id,inspection_number,resident_id,inspection_type,status,inspection_date,created_at,updated_at").order("created_at", { ascending: false }),
       supabase.from("notices").select("id,notice_number,title,status,is_active,publish_date,expiry_date,created_at,updated_at").order("created_at", { ascending: false }),
+      supabase.from("rooms").select("id,status"),
+      supabase.from("beds").select("id,room_id,status"),
     ]);
 
     const failed = results.find((result) => result.error)?.error;
@@ -72,7 +74,8 @@ export default function DashboardPage() {
         contracts: results[2].data ?? [], bills: results[3].data ?? [],
         payments: results[4].data ?? [], receipts: results[5].data ?? [],
         maintenance: results[6].data ?? [], inspections: results[7].data ?? [],
-        notices: results[8].data ?? [],
+        notices: results[8].data ?? [], rooms: results[9].data ?? [],
+        beds: results[10].data ?? [],
       });
     }
 

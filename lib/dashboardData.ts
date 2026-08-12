@@ -10,6 +10,8 @@ export type DashboardData = {
   bills: DashboardRow[];
   payments: DashboardRow[];
   receipts: DashboardRow[];
+  rooms: DashboardRow[];
+  beds: DashboardRow[];
   maintenance: DashboardRow[];
   inspections: DashboardRow[];
   notices: DashboardRow[];
@@ -85,6 +87,12 @@ export function buildDashboardSummary(data: DashboardData, now = new Date()) {
     data.residents.map((resident) => [text(resident.id), resident]),
   );
   const contractsByAdmission = new Map<string, DashboardRow>();
+  const roomsById = new Map(
+    data.rooms.map((room) => [text(room.id), room]),
+  );
+  const bedsById = new Map(
+    data.beds.map((bed) => [text(bed.id), bed]),
+  );
 
   [...data.contracts]
     .sort((left, right) => text(right.created_at).localeCompare(text(left.created_at)))
@@ -117,12 +125,29 @@ export function buildDashboardSummary(data: DashboardData, now = new Date()) {
   const pendingDeposits = pendingAdmissions.filter(
     (admission) => normalized(admission.deposit_status) === "pending",
   );
-  const readyForActivation = pendingAdmissions.filter((admission) =>
-    isAdmissionReadyForActivation(
+  const readyForActivation = pendingAdmissions.filter((admission) => {
+    const room = roomsById.get(text(admission.room_id));
+    const bed = bedsById.get(text(admission.bed_id));
+    const resident = residentsById.get(text(admission.resident_id));
+    const allocationConflict = pendingAdmissions.some(
+      (other) =>
+        text(other.id) !== text(admission.id) &&
+        text(other.bed_id) === text(admission.bed_id),
+    ) || data.admissions.some(
+      (other) =>
+        normalized(other.status) === "active" &&
+        text(other.bed_id) === text(admission.bed_id),
+    );
+    return isAdmissionReadyForActivation(
       text(admission.deposit_status),
       contractsByAdmission.get(text(admission.id)),
-    ),
-  );
+    ) &&
+      normalized(resident?.status) !== "archived" &&
+      ["available", "active"].includes(normalized(room?.status)) &&
+      normalized(bed?.status) === "occupied" &&
+      text(bed?.room_id) === text(admission.room_id) &&
+      !allocationConflict;
+  });
   const blockedByContractApproval = pendingAdmissions.filter((admission) => {
     const contract = contractsByAdmission.get(text(admission.id));
     return (

@@ -21,6 +21,10 @@ import {
   notificationWarning,
   requestEventNotification,
 } from "@/lib/notifications/client";
+import {
+  isSecurityDepositReceipt,
+  residentReceiptNotes,
+} from "@/lib/paymentReceiptPurpose";
 
 type GenericRow = Record<string, unknown>;
 
@@ -64,6 +68,7 @@ type Receipt = {
 
 const MAX_FILE_SIZE = 5 * 1024 * 1024;
 const SAFE_FILE_TYPES = new Set(["application/pdf", "image/jpeg", "image/png"]);
+const SECURITY_DEPOSIT_OPTION = "security-deposit";
 const inputClass =
   "w-full rounded-xl border border-slate-300 bg-white px-3 py-2.5 text-sm text-slate-900 outline-none focus:border-indigo-500 focus:ring-4 focus:ring-indigo-100 disabled:cursor-not-allowed disabled:bg-slate-100";
 
@@ -114,6 +119,7 @@ function firstText(row: GenericRow | undefined, keys: string[]) {
 
 export default function ResidentPaymentsPage() {
   const [resident, setResident] = useState<AuthenticatedResident | null>(null);
+  const [admission, setAdmission] = useState<GenericRow | null>(null);
   const [bills, setBills] = useState<Bill[]>([]);
   const [payments, setPayments] = useState<Payment[]>([]);
   const [receipts, setReceipts] = useState<Receipt[]>([]);
@@ -177,6 +183,7 @@ export default function ResidentPaymentsPage() {
     });
 
     setResident(portalResult.data.resident);
+    setAdmission(portalResult.data.admission);
     setBills(calculatedBills);
     setPayments(paymentRows);
     setReceipts(portalResult.data.receipts as Receipt[]);
@@ -194,22 +201,39 @@ export default function ResidentPaymentsPage() {
     () => bills.find((bill) => bill.id === selectedBillId),
     [bills, selectedBillId],
   );
+  const depositOutstanding =
+    normalized(admission?.status) === "pending" &&
+    normalized(admission?.deposit_status) === "pending"
+      ? Math.max(roundMoney(Number(admission?.security_deposit ?? 0)), 0)
+      : 0;
+  const pendingDepositReceipt = receipts.some(
+    (receipt) =>
+      !receipt.bill_id &&
+      isSecurityDepositReceipt(receipt.notes) &&
+      normalized(receipt.status) === "pending verification",
+  );
 
   const summary = useMemo(() => {
     const operationalBills = bills.filter((bill) => isPayableBill(bill.bill_status));
     return {
-      outstanding: operationalBills.reduce((sum, bill) => sum + bill.outstanding, 0),
+      outstanding: operationalBills.reduce((sum, bill) => sum + bill.outstanding, depositOutstanding),
       pendingBills: operationalBills.filter((bill) => bill.outstanding > 0).length,
       overdueBills: operationalBills.filter((bill) => normalized(bill.displayStatus) === "overdue").length,
       verifiedPayments: payments.filter((payment) => normalized(payment.payment_status) === "verified").reduce((sum, payment) => sum + Number(payment.amount || 0), 0),
       pendingReceipts: receipts.filter((receipt) => normalized(receipt.status) === "pending verification").length,
     };
-  }, [bills, payments, receipts]);
+  }, [bills, depositOutstanding, payments, receipts]);
 
   function selectBill(billId: string) {
     const bill = bills.find((item) => item.id === billId);
     setSelectedBillId(billId);
-    setAmount(bill ? String(bill.outstanding) : "");
+    setAmount(
+      billId === SECURITY_DEPOSIT_OPTION
+        ? String(depositOutstanding)
+        : bill
+          ? String(bill.outstanding)
+          : "",
+    );
   }
 
   function handleFileChange(event: ChangeEvent<HTMLInputElement>) {
@@ -244,7 +268,7 @@ export default function ResidentPaymentsPage() {
     setError("");
 
     if (!selectedBillId || !paymentMethod.trim() || !selectedFile) {
-      setError("Bill, payment method, and receipt file are required.");
+      setError("Payment obligation, payment method, and receipt file are required.");
       setUploading(false);
       return;
     }
@@ -267,6 +291,56 @@ export default function ResidentPaymentsPage() {
       return;
     }
     const residentId = resolved.resident.id;
+    if (selectedBillId === SECURITY_DEPOSIT_OPTION) {
+      const {
+        data: { session },
+      } = await supabase.auth.getSession();
+      const accessToken = session?.access_token;
+      if (!accessToken) {
+        setError("Your resident session could not be verified. Please sign in again.");
+        setUploading(false);
+        return;
+      }
+
+      const formData = new FormData();
+      formData.set("file", selectedFile);
+      formData.set("paymentMethod", paymentMethod.trim());
+      formData.set("referenceNumber", referenceNumber.trim());
+      formData.set("notes", notes.trim());
+      const response = await fetch("/api/resident-portal/deposit-receipts", {
+        method: "POST",
+        headers: { Authorization: `Bearer ${accessToken}` },
+        body: formData,
+      });
+      const payload = (await response.json().catch(() => null)) as
+        | { message?: string; error?: string; notificationWarning?: boolean }
+        | null;
+      if (!response.ok) {
+        setError(payload?.error || "The security deposit receipt could not be submitted.");
+        setUploading(false);
+        return;
+      }
+
+      setMessage(
+        `${payload?.message || "Security deposit receipt submitted for verification."}${
+          payload?.notificationWarning
+            ? " The record was saved, but its notification could not be delivered."
+            : ""
+        }`,
+      );
+      setSelectedBillId("");
+      setAmount("");
+      setPaymentMethod("");
+      setReferenceNumber("");
+      setNotes("");
+      setSelectedFile(null);
+      const input = document.getElementById("payment-receipt-file") as HTMLInputElement | null;
+      if (input) input.value = "";
+      await loadData();
+      setUploading(false);
+      return;
+    }
+
     const { data: currentBill, error: billError } = await supabase
       .from("bills")
       .select("id, resident_id, total_amount, bill_status")
@@ -388,16 +462,16 @@ export default function ResidentPaymentsPage() {
 
         {(message || error) && <section className={`rounded-2xl border px-4 py-3 text-sm font-medium ${error ? "border-red-200 bg-red-50 text-red-700" : "border-emerald-200 bg-emerald-50 text-emerald-700"}`}>{error || message}</section>}
 
-        <section className="grid gap-4 sm:grid-cols-2 xl:grid-cols-5">
-          {[['Total Outstanding', money(summary.outstanding)], ['Current Pending Bills', String(summary.pendingBills)], ['Overdue Bills', String(summary.overdueBills)], ['Verified Payments', money(summary.verifiedPayments)], ['Pending Verification', String(summary.pendingReceipts)]].map(([label, value]) => <article key={label} className="rounded-2xl border border-slate-200 bg-white p-5 shadow-sm"><p className="text-sm text-slate-500">{label}</p><p className="mt-2 text-2xl font-bold">{value}</p></article>)}
+        <section className="grid gap-4 sm:grid-cols-2 xl:grid-cols-6">
+          {[['Total Outstanding', money(summary.outstanding)], ['Security Deposit Outstanding', money(depositOutstanding)], ['Current Pending Bills', String(summary.pendingBills)], ['Overdue Bills', String(summary.overdueBills)], ['Verified Bill Payments', money(summary.verifiedPayments)], ['Pending Verification', String(summary.pendingReceipts)]].map(([label, value]) => <article key={label} className="rounded-2xl border border-slate-200 bg-white p-5 shadow-sm"><p className="text-sm text-slate-500">{label}</p><p className="mt-2 text-2xl font-bold">{value}</p></article>)}
         </section>
 
         <section className="rounded-3xl border border-slate-200 bg-white p-6 shadow-sm">
           <h2 className="text-xl font-bold">Upload Payment Receipt</h2>
           <p className="mt-1 text-sm text-slate-500">PDF, JPEG, or PNG; maximum 5 MB. Submission remains pending until verified.</p>
           <form onSubmit={uploadReceipt} className="mt-5 grid gap-4 md:grid-cols-2">
-            <label><span className="mb-2 block text-sm font-semibold">Bill *</span><select required value={selectedBillId} onChange={(event) => selectBill(event.target.value)} disabled={loading || uploading} className={inputClass}><option value="">Select an outstanding bill</option>{bills.filter((bill) => isPayableBill(bill.bill_status) && bill.outstanding > 0).map((bill) => <option key={bill.id} value={bill.id}>{bill.bill_number} — {monthLabel(bill.billing_month)} — {money(bill.outstanding)}</option>)}</select></label>
-            <label><span className="mb-2 block text-sm font-semibold">Amount *</span><input required type="number" min="0.01" step="0.01" max={selectedBill?.outstanding} value={amount} onChange={(event) => setAmount(event.target.value)} disabled={uploading || !selectedBill} className={inputClass} /></label>
+            <label><span className="mb-2 block text-sm font-semibold">Payment For *</span><select required value={selectedBillId} onChange={(event) => selectBill(event.target.value)} disabled={loading || uploading} className={inputClass}><option value="">Select an outstanding obligation</option>{depositOutstanding > 0 && <option value={SECURITY_DEPOSIT_OPTION} disabled={pendingDepositReceipt}>Security Deposit — {money(depositOutstanding)}{pendingDepositReceipt ? " — Pending Verification" : ""}</option>}{bills.filter((bill) => isPayableBill(bill.bill_status) && bill.outstanding > 0).map((bill) => <option key={bill.id} value={bill.id}>{bill.bill_number} — {monthLabel(bill.billing_month)} — {money(bill.outstanding)}</option>)}</select></label>
+            <label><span className="mb-2 block text-sm font-semibold">Amount *</span><input required type="number" min="0.01" step="0.01" max={selectedBillId === SECURITY_DEPOSIT_OPTION ? depositOutstanding : selectedBill?.outstanding} value={amount} onChange={(event) => setAmount(event.target.value)} readOnly={selectedBillId === SECURITY_DEPOSIT_OPTION} disabled={uploading || (!selectedBill && selectedBillId !== SECURITY_DEPOSIT_OPTION)} className={inputClass} /></label>
             <label><span className="mb-2 block text-sm font-semibold">Payment Method *</span><input required value={paymentMethod} onChange={(event) => setPaymentMethod(event.target.value)} disabled={uploading} className={inputClass} placeholder="Cash deposit, bank transfer, card, etc." /></label>
             <label><span className="mb-2 block text-sm font-semibold">Reference Number</span><input value={referenceNumber} onChange={(event) => setReferenceNumber(event.target.value)} disabled={uploading} className={inputClass} placeholder="Transaction reference" /></label>
             <label className="md:col-span-2"><span className="mb-2 block text-sm font-semibold">Receipt File *</span><input id="payment-receipt-file" required type="file" accept="application/pdf,image/jpeg,image/png,.pdf,.jpg,.jpeg,.png" onChange={handleFileChange} disabled={uploading} className={inputClass} /></label>
@@ -407,7 +481,7 @@ export default function ResidentPaymentsPage() {
         </section>
 
         <HistoryTable title="Payment History" headers={["Payment", "Bill", "Date", "Amount", "Method", "Reference", "Status", "Verification", "Notes"]} loading={loading} empty="No payment history found." rows={payments.map((payment) => { const bill = bills.find((item) => item.id === payment.bill_id); return [payment.payment_number ?? "—", bill?.bill_number ?? "Historical bill", payment.payment_date, money(payment.amount), payment.payment_method || "Payment Method", payment.reference_number ?? "—", <Status key="status" value={payment.payment_status} />, payment.verified || normalized(payment.payment_status) === "verified" ? "Verified" : "Not verified", payment.notes ?? "—"]; })} />
-        <HistoryTable title="Receipt History" headers={["Date", "Bill", "Amount", "Reference", "Status", "Notes"]} loading={loading} empty="No receipt submissions found." rows={receipts.map((receipt) => { const bill = bills.find((item) => item.id === receipt.bill_id); return [receipt.created_at.slice(0, 10), bill?.bill_number ?? "Historical bill", money(receipt.amount), receipt.reference_number ?? "—", <Status key="status" value={receipt.status} />, receipt.notes ?? "—"]; })} />
+        <HistoryTable title="Receipt History" headers={["Date", "Payment For", "Amount", "Reference", "Status", "Notes"]} loading={loading} empty="No receipt submissions found." rows={receipts.map((receipt) => { const bill = bills.find((item) => item.id === receipt.bill_id); const depositReceipt = !receipt.bill_id && isSecurityDepositReceipt(receipt.notes); return [receipt.created_at.slice(0, 10), depositReceipt ? "Security Deposit" : bill?.bill_number ?? "Historical bill", money(receipt.amount), receipt.reference_number ?? "—", <Status key="status" value={receipt.status} />, residentReceiptNotes(receipt.notes) || "—"]; })} />
       </div>
     </main>
   );

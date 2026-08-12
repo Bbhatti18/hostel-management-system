@@ -56,8 +56,6 @@ type ResidentForm = {
   cnic: string;
 };
 
-type DepositStatus = "Pending" | "Received";
-
 const emptyResidentForm: ResidentForm = {
   fullName: "",
   fatherName: "",
@@ -107,8 +105,6 @@ export default function AdmissionForm({
   const [admissionDate, setAdmissionDate] = useState("");
   const [monthlyRent, setMonthlyRent] = useState("");
   const [securityDeposit, setSecurityDeposit] = useState("");
-  const [depositStatus, setDepositStatus] =
-    useState<DepositStatus>("Pending");
   const [specialClauses, setSpecialClauses] = useState("");
   const [residents, setResidents] = useState<Resident[]>([]);
   const [rooms, setRooms] = useState<Room[]>([]);
@@ -511,7 +507,7 @@ export default function AdmissionForm({
           admission_date: admissionDate,
           monthly_rent: Number(monthlyRent),
           security_deposit: Number(securityDeposit || 0),
-          deposit_status: depositStatus,
+          deposit_status: "Pending",
           status: "Pending",
         })
         .select("id")
@@ -621,7 +617,6 @@ export default function AdmissionForm({
       setAdmissionDate("");
       setMonthlyRent("");
       setSecurityDeposit("");
-      setDepositStatus("Pending");
       setSpecialClauses("");
       setMessage(
         `Admission saved as Pending and its contract was prepared for resident signature.${
@@ -772,17 +767,11 @@ export default function AdmissionForm({
               <span className="mb-2 block text-sm font-semibold text-slate-700">
                 Deposit Status
               </span>
-              <select
-                value={depositStatus}
-                onChange={(event) =>
-                  setDepositStatus(event.target.value as DepositStatus)
-                }
+              <input
+                value="Pending — verify a submitted receipt in Payment Verification"
                 className={inputClass}
-                disabled={loading || saving}
-              >
-                <option value="Pending">Pending</option>
-                <option value="Received">Received</option>
-              </select>
+                disabled
+              />
             </label>
 
             <label className="md:col-span-2 xl:col-span-4">

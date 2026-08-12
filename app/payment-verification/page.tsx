@@ -9,6 +9,10 @@ import {
 import PaymentsNavigation from "@/components/payments/PaymentsNavigation";
 import { supabase } from "@/lib/supabase";
 import { getSupabaseErrorMessage } from "@/lib/supabaseErrors";
+import {
+  isSecurityDepositReceipt,
+  residentReceiptNotes,
+} from "@/lib/paymentReceiptPurpose";
 
 type GenericRow = Record<string, unknown>;
 
@@ -101,11 +105,7 @@ function receiptPaymentMethod(notes: string | null) {
 }
 
 function receiptNotes(receipt: PaymentReceipt) {
-  const submittedNotes = (receipt.notes ?? "")
-    .split("\n")
-    .filter((line) => !/^Payment method:/i.test(line.trim()))
-    .join(" ")
-    .trim();
+  const submittedNotes = residentReceiptNotes(receipt.notes);
   return [
     submittedNotes,
     receipt.remarks ? `Review: ${receipt.remarks}` : "",
@@ -191,6 +191,9 @@ export default function PaymentVerificationPage() {
         residentName(resident),
         receipt.reference_number ?? "",
         firstText(bill, ["bill_number"]),
+        !receipt.bill_id && isSecurityDepositReceipt(receipt.notes)
+          ? "Security Deposit"
+          : "",
       ]
         .join(" ")
         .toLowerCase();
@@ -327,7 +330,7 @@ export default function PaymentVerificationPage() {
               value={search}
               onChange={(event) => setSearch(event.target.value)}
               className={inputClass}
-              placeholder="Search resident, bill or reference"
+              placeholder="Search resident, purpose or reference"
             />
 
             <select
@@ -360,7 +363,7 @@ export default function PaymentVerificationPage() {
                 <tr>
                   {[
                     "Resident",
-                    "Bill",
+                    "Payment For",
                     "Billing Month",
                     "Amount",
                     "Method",
@@ -427,7 +430,9 @@ export default function PaymentVerificationPage() {
                         </td>
 
                         <td className="px-5 py-4 text-sm text-slate-700">
-                          {firstText(bill, ["bill_number"]) || "No bill"}
+                          {!receipt.bill_id && isSecurityDepositReceipt(receipt.notes)
+                            ? "Security Deposit"
+                            : firstText(bill, ["bill_number"]) || "No bill"}
                         </td>
 
                         <td className="px-5 py-4 text-sm text-slate-700">
