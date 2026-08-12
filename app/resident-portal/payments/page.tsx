@@ -23,6 +23,7 @@ import {
 } from "@/lib/notifications/client";
 import {
   isSecurityDepositReceipt,
+  receiptPaymentMethod,
   residentReceiptNotes,
 } from "@/lib/paymentReceiptPurpose";
 
@@ -53,6 +54,7 @@ type Payment = {
   payment_status: string;
   verified: boolean;
   notes: string | null;
+  created_at: string;
 };
 
 type Receipt = {
@@ -212,17 +214,87 @@ export default function ResidentPaymentsPage() {
       isSecurityDepositReceipt(receipt.notes) &&
       normalized(receipt.status) === "pending verification",
   );
+  const verifiedDepositReceipts = useMemo(
+    () =>
+      Array.from(
+        new Map(
+          receipts
+            .filter(
+              (receipt) =>
+                !receipt.bill_id &&
+                isSecurityDepositReceipt(receipt.notes) &&
+                normalized(receipt.status) === "verified",
+            )
+            .map((receipt) => [receipt.id, receipt]),
+        ).values(),
+      ),
+    [receipts],
+  );
 
   const summary = useMemo(() => {
     const operationalBills = bills.filter((bill) => isPayableBill(bill.bill_status));
+    const verifiedBillPayments = payments
+      .filter((payment) => normalized(payment.payment_status) === "verified")
+      .reduce((sum, payment) => sum + Number(payment.amount || 0), 0);
+    const verifiedDeposits = verifiedDepositReceipts.reduce(
+      (sum, receipt) => sum + Number(receipt.amount || 0),
+      0,
+    );
     return {
       outstanding: operationalBills.reduce((sum, bill) => sum + bill.outstanding, depositOutstanding),
       pendingBills: operationalBills.filter((bill) => bill.outstanding > 0).length,
       overdueBills: operationalBills.filter((bill) => normalized(bill.displayStatus) === "overdue").length,
-      verifiedPayments: payments.filter((payment) => normalized(payment.payment_status) === "verified").reduce((sum, payment) => sum + Number(payment.amount || 0), 0),
+      verifiedPayments: verifiedBillPayments + verifiedDeposits,
       pendingReceipts: receipts.filter((receipt) => normalized(receipt.status) === "pending verification").length,
     };
-  }, [bills, depositOutstanding, payments, receipts]);
+  }, [bills, depositOutstanding, payments, receipts, verifiedDepositReceipts]);
+
+  const paymentHistoryRows = useMemo(() => {
+    const entries: { id: string; sortDate: string; row: React.ReactNode[] }[] = [];
+    for (const payment of payments) {
+      if (normalized(payment.payment_status) !== "verified") continue;
+      const bill = bills.find((item) => item.id === payment.bill_id);
+      entries.push({
+        id: `payment-${payment.id}`,
+        sortDate: payment.payment_date || payment.created_at,
+        row: [
+          payment.payment_number ?? "—",
+          bill?.bill_number ?? "Historical bill",
+          payment.payment_date,
+          money(payment.amount),
+          payment.payment_method || "Payment Method",
+          payment.reference_number ?? "—",
+          <Status key="status" value="Verified" />,
+          "Verified",
+          payment.notes ?? "—",
+        ],
+      });
+    }
+    for (const receipt of verifiedDepositReceipts) {
+      entries.push({
+        id: `deposit-${receipt.id}`,
+        sortDate: receipt.created_at,
+        row: [
+          "—",
+          "Security Deposit",
+          receipt.created_at.slice(0, 10),
+          money(receipt.amount),
+          receiptPaymentMethod(receipt.notes) || "Payment Method",
+          receipt.reference_number ?? "—",
+          <Status key="status" value="Verified" />,
+          "Verified",
+          residentReceiptNotes(receipt.notes) || "—",
+        ],
+      });
+    }
+    return entries
+      .sort((left, right) => {
+        const dateDifference =
+          new Date(right.sortDate).getTime() - new Date(left.sortDate).getTime();
+        return dateDifference || right.id.localeCompare(left.id);
+      })
+      .map((entry) => entry.row);
+  }, [bills, payments, verifiedDepositReceipts]);
 
   function selectBill(billId: string) {
     const bill = bills.find((item) => item.id === billId);
@@ -463,7 +535,7 @@ export default function ResidentPaymentsPage() {
         {(message || error) && <section className={`rounded-2xl border px-4 py-3 text-sm font-medium ${error ? "border-red-200 bg-red-50 text-red-700" : "border-emerald-200 bg-emerald-50 text-emerald-700"}`}>{error || message}</section>}
 
         <section className="grid gap-4 sm:grid-cols-2 xl:grid-cols-6">
-          {[['Total Outstanding', money(summary.outstanding)], ['Security Deposit Outstanding', money(depositOutstanding)], ['Current Pending Bills', String(summary.pendingBills)], ['Overdue Bills', String(summary.overdueBills)], ['Verified Bill Payments', money(summary.verifiedPayments)], ['Pending Verification', String(summary.pendingReceipts)]].map(([label, value]) => <article key={label} className="rounded-2xl border border-slate-200 bg-white p-5 shadow-sm"><p className="text-sm text-slate-500">{label}</p><p className="mt-2 text-2xl font-bold">{value}</p></article>)}
+          {[['Total Outstanding', money(summary.outstanding)], ['Security Deposit Outstanding', money(depositOutstanding)], ['Current Pending Bills', String(summary.pendingBills)], ['Overdue Bills', String(summary.overdueBills)], ['Verified Payments', money(summary.verifiedPayments)], ['Pending Verification', String(summary.pendingReceipts)]].map(([label, value]) => <article key={label} className="rounded-2xl border border-slate-200 bg-white p-5 shadow-sm"><p className="text-sm text-slate-500">{label}</p><p className="mt-2 text-2xl font-bold">{value}</p></article>)}
         </section>
 
         <section className="rounded-3xl border border-slate-200 bg-white p-6 shadow-sm">
@@ -480,7 +552,7 @@ export default function ResidentPaymentsPage() {
           </form>
         </section>
 
-        <HistoryTable title="Payment History" headers={["Payment", "Bill", "Date", "Amount", "Method", "Reference", "Status", "Verification", "Notes"]} loading={loading} empty="No payment history found." rows={payments.map((payment) => { const bill = bills.find((item) => item.id === payment.bill_id); return [payment.payment_number ?? "—", bill?.bill_number ?? "Historical bill", payment.payment_date, money(payment.amount), payment.payment_method || "Payment Method", payment.reference_number ?? "—", <Status key="status" value={payment.payment_status} />, payment.verified || normalized(payment.payment_status) === "verified" ? "Verified" : "Not verified", payment.notes ?? "—"]; })} />
+        <HistoryTable title="Payment History" headers={["Payment", "Type / Purpose", "Date", "Amount", "Method", "Reference", "Status", "Verification", "Notes"]} loading={loading} empty="No payment history found." rows={paymentHistoryRows} />
         <HistoryTable title="Receipt History" headers={["Date", "Payment For", "Amount", "Reference", "Status", "Notes"]} loading={loading} empty="No receipt submissions found." rows={receipts.map((receipt) => { const bill = bills.find((item) => item.id === receipt.bill_id); const depositReceipt = !receipt.bill_id && isSecurityDepositReceipt(receipt.notes); return [receipt.created_at.slice(0, 10), depositReceipt ? "Security Deposit" : bill?.bill_number ?? "Historical bill", money(receipt.amount), receipt.reference_number ?? "—", <Status key="status" value={receipt.status} />, residentReceiptNotes(receipt.notes) || "—"]; })} />
       </div>
     </main>

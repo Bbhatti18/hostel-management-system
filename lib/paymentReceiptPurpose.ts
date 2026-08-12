@@ -31,6 +31,10 @@ export function isSecurityDepositReceipt(notes: unknown) {
   return Boolean(securityDepositAdmissionId(notes));
 }
 
+export function receiptPaymentMethod(notes: unknown) {
+  return String(notes ?? "").match(/^Payment method:\s*(.+)$/im)?.[1]?.trim() ?? "";
+}
+
 export function residentReceiptNotes(notes: unknown) {
   return String(notes ?? "")
     .split("\n")
