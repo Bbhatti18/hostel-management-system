@@ -4,6 +4,36 @@ export const BED_STATUS = {
   INACTIVE: "Inactive",
 } as const;
 
+export const RESIDENT_STATUS = {
+  ACTIVE: "Active",
+  INACTIVE: "Inactive",
+  RESERVED: "Reserved",
+  NOTICE_PERIOD: "Notice Period",
+  CHECKED_OUT: "Checked Out",
+  ARCHIVED: "Archived",
+} as const;
+
+export type ResidentStatus =
+  (typeof RESIDENT_STATUS)[keyof typeof RESIDENT_STATUS];
+
+const PRESERVED_RESIDENT_STATUSES = new Set<ResidentStatus>([
+  RESIDENT_STATUS.RESERVED,
+  RESIDENT_STATUS.NOTICE_PERIOD,
+  RESIDENT_STATUS.CHECKED_OUT,
+  RESIDENT_STATUS.ARCHIVED,
+]);
+
+export function getOperationalResidentStatus(
+  profileStatus: ResidentStatus,
+  hasActiveAdmission: boolean,
+): ResidentStatus {
+  if (PRESERVED_RESIDENT_STATUSES.has(profileStatus)) return profileStatus;
+
+  return hasActiveAdmission
+    ? RESIDENT_STATUS.ACTIVE
+    : RESIDENT_STATUS.INACTIVE;
+}
+
 export type BedStatus = (typeof BED_STATUS)[keyof typeof BED_STATUS];
 export type ReadableBedStatus = BedStatus | "Available";
 

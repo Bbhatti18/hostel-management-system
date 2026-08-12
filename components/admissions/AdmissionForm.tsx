@@ -21,6 +21,7 @@ import {
 import {
   ALLOCATABLE_BED_STATUSES,
   BED_STATUS,
+  RESIDENT_STATUS,
   isAllocatableBedStatus,
 } from "@/lib/statuses";
 
@@ -296,7 +297,7 @@ export default function AdmissionForm({
           phone,
           email,
           cnic,
-          status: "Active",
+          status: RESIDENT_STATUS.INACTIVE,
           created_at: now,
           updated_at: now,
         })

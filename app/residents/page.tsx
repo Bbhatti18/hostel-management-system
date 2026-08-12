@@ -15,14 +15,11 @@ import {
   getSupabaseErrorMessage,
   isMissingColumnError,
 } from "@/lib/supabaseErrors";
-
-type ResidentStatus =
-  | "Active"
-  | "Inactive"
-  | "Reserved"
-  | "Notice Period"
-  | "Checked Out"
-  | "Archived";
+import {
+  getOperationalResidentStatus,
+  RESIDENT_STATUS,
+  type ResidentStatus,
+} from "@/lib/statuses";
 
 type GenericRow = Record<string, unknown>;
 
@@ -115,7 +112,7 @@ const emptyForm: ResidentForm = {
   company_university: "",
   photo_url: "",
   id_card_url: "",
-  status: "Active",
+  status: RESIDENT_STATUS.INACTIVE,
 };
 
 const inputClass =
@@ -223,16 +220,38 @@ export default function ResidentsPage() {
     setLoading(true);
     setError("");
 
-    const { data, error: loadError } = await supabase
-      .from("residents")
-      .select("*")
-      .order("created_at", { ascending: false });
+    const [residentResult, activeAdmissionResult] = await Promise.all([
+      supabase
+        .from("residents")
+        .select("*")
+        .order("created_at", { ascending: false }),
+      supabase
+        .from("admissions")
+        .select("resident_id")
+        .eq("status", "Active"),
+    ]);
+
+    const loadError = residentResult.error || activeAdmissionResult.error;
 
     if (loadError) {
       setError(getSupabaseErrorMessage(loadError, "Unable to load residents."));
       setResidents([]);
     } else {
-      setResidents((data ?? []) as Resident[]);
+      const activeResidentIds = new Set(
+        (activeAdmissionResult.data ?? []).map((admission) =>
+          String(admission.resident_id),
+        ),
+      );
+
+      setResidents(
+        ((residentResult.data ?? []) as Resident[]).map((resident) => ({
+          ...resident,
+          status: getOperationalResidentStatus(
+            resident.status,
+            activeResidentIds.has(resident.id),
+          ),
+        })),
+      );
     }
 
     setLoading(false);
@@ -294,6 +313,10 @@ export default function ResidentsPage() {
       if (!active) return;
 
       const admission = (admissionResult.data ?? null) as GenericRow | null;
+      residentRecord.status = getOperationalResidentStatus(
+        residentRecord.status,
+        firstText(admission, ["status"]) === "Active",
+      );
       const roomId = firstText(admission, ["room_id"]);
       const bedId = firstText(admission, ["bed_id"]);
 
@@ -569,7 +592,7 @@ export default function ResidentsPage() {
       photo_url: form.photo_url.trim() || null,
       id_card_url: form.id_card_url.trim() || null,
       address: form.permanent_address.trim() || null,
-      status: form.status,
+      status: editingId ? form.status : RESIDENT_STATUS.INACTIVE,
       updated_at: now,
       ...(editingId ? {} : { created_at: now }),
     };
@@ -581,7 +604,7 @@ export default function ResidentsPage() {
       cnic: form.cnic.trim() || null,
       emergency_contact: form.emergency_contact.trim() || null,
       address: form.permanent_address.trim() || null,
-      status: form.status,
+      status: editingId ? form.status : RESIDENT_STATUS.INACTIVE,
       updated_at: now,
       ...(editingId ? {} : { created_at: now }),
     };
@@ -859,7 +882,7 @@ export default function ResidentsPage() {
                 </Field>
                 <Field label="Status">
                   <select value={form.status} onChange={(event) => updateField("status", event.target.value as ResidentStatus)} className={inputClass}>
-                    <option value="Active">Active</option>
+                    <option value="Active" disabled>Active (managed by Admissions)</option>
                     <option value="Inactive">Inactive</option>
                     <option value="Reserved">Reserved</option>
                     <option value="Notice Period">Notice Period</option>
