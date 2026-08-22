@@ -2,10 +2,11 @@ import "server-only";
 
 import { supabaseAdmin } from "@/lib/supabaseAdmin";
 import { securityDepositAdmissionId } from "@/lib/paymentReceiptPurpose";
-import type { NotificationEventType, NotificationRequestResult } from "@/lib/notifications/types";
+import type { NotificationChannel, NotificationEventType, NotificationRequestOptions, NotificationRequestResult } from "@/lib/notifications/types";
 
 type Row = Record<string, unknown>;
 type ChannelStatus = "sent" | "skipped" | "configuration_required" | "failed";
+type ChannelDelivery = { status: ChannelStatus; providerMessageId: string | null };
 type EventMessage = {
   eventKey: string;
   residentId: string;
@@ -24,7 +25,11 @@ const templateEnv: Record<NotificationEventType, string> = {
   payment_verified: "WHATSAPP_TEMPLATE_PAYMENT_VERIFIED",
   payment_rejected: "WHATSAPP_TEMPLATE_PAYMENT_REJECTED",
   contract_approved: "WHATSAPP_TEMPLATE_CONTRACT_APPROVED",
+  resident_notice_created: "WHATSAPP_TEMPLATE_RESIDENT_NOTICE_CREATED",
+  resident_login_details_sent: "WHATSAPP_TEMPLATE_RESIDENT_LOGIN_DETAILS_SENT",
 };
+
+const defaultChannels: NotificationChannel[] = ["email", "whatsapp"];
 
 function text(value: unknown) {
   return String(value ?? "").trim();
@@ -32,6 +37,12 @@ function text(value: unknown) {
 
 function normalized(value: unknown) {
   return text(value).toLowerCase();
+}
+
+function safeErrorMessage(error: unknown) {
+  return error instanceof Error && error.message.trim()
+    ? error.message
+    : "Unknown error";
 }
 
 function money(value: unknown) {
@@ -46,6 +57,15 @@ function displayDate(value: unknown) {
   return Number.isNaN(parsed.getTime())
     ? raw
     : parsed.toLocaleDateString("en-PK", { year: "numeric", month: "short", day: "numeric", timeZone: "UTC" });
+}
+
+function siteUrl() {
+  return text(process.env.NEXT_PUBLIC_SITE_URL || process.env.NEXT_PUBLIC_APP_URL).replace(/\/$/, "");
+}
+
+function portalUrl(path = "") {
+  const base = siteUrl();
+  return base ? `${base}/resident-portal${path}` : `/resident-portal${path}`;
 }
 
 function recent(value: unknown) {
@@ -99,7 +119,7 @@ function message(
     email: text(resident.email),
     phone: text(resident.phone),
     subject,
-    body: [`Hello ${name},`, "", ...lines, "", "Open the StayHub Resident Portal to review the latest details.", "", "StayHub / Hostel Management System"].join("\n"),
+    body: [`Hello ${name},`, "", ...lines, "", `Resident Portal: ${portalUrl()}`, "", "StayHub / Hostel Management System"].join("\n"),
     parameters,
   };
 }
@@ -202,18 +222,130 @@ async function resolveContract(entityId: string) {
   return message("contract_approved", entityId, resident, "Your StayHub contract signature was approved", ["Your resident contract signature has been approved by hostel administration.", `Deposit status: ${values[2]}`, `Admission status: ${values[3]}`, state], values);
 }
 
+async function resolveNotice(entityId: string, requestedRecipientIds: string[]) {
+  const { data: notice, error } = await supabaseAdmin
+    .from("notices")
+    .select("id, title, description, audience, resident_id, status, publish_date, created_at")
+    .eq("id", entityId)
+    .maybeSingle();
+  if (error || !notice || !recent(notice.created_at)) throw new Error("event_unavailable");
+
+  const audience = normalized(notice.audience);
+  let recipientIds: string[] = [];
+  if (audience === "all residents") {
+    const { data, error: residentError } = await supabaseAdmin
+      .from("residents")
+      .select("id")
+      .ilike("status", "Active");
+    if (residentError) throw new Error("recipient_unavailable");
+    recipientIds = (data ?? []).map((row) => text(row.id));
+  } else if (audience === "selected residents") {
+    const { data, error: recipientError } = await supabaseAdmin
+      .from("notice_recipients")
+      .select("resident_id")
+      .eq("notice_id", entityId);
+    if (recipientError) throw new Error("recipient_unavailable");
+    recipientIds = (data ?? []).map((row) => text(row.resident_id));
+  } else if (audience === "specific resident" && notice.resident_id) {
+    recipientIds = [text(notice.resident_id)];
+  }
+
+  if (requestedRecipientIds.length) {
+    const requested = new Set(requestedRecipientIds);
+    recipientIds = recipientIds.filter((id) => requested.has(id));
+  }
+  recipientIds = [...new Set(recipientIds.filter(Boolean))];
+  if (!recipientIds.length) throw new Error("recipient_unavailable");
+
+  const { data: residents, error: residentError } = await supabaseAdmin
+    .from("residents")
+    .select("id, full_name, email, phone, status")
+    .in("id", recipientIds);
+  if (residentError) throw new Error("recipient_unavailable");
+
+  const summary = text(notice.description).slice(0, 240);
+  const published = displayDate(notice.publish_date || notice.created_at);
+  return (residents ?? [])
+    .filter((resident) => normalized(resident.status) !== "archived")
+    .map((resident) => {
+      const event = message(
+        "resident_notice_created",
+        entityId,
+        resident,
+        `StayHub notice: ${text(notice.title) || "New notice"}`,
+        [
+          `Notice: ${text(notice.title) || "New notice"}`,
+          summary,
+          `Published: ${published}`,
+          `View the complete notice: ${portalUrl("/notices")}`,
+        ],
+        [text(resident.full_name) || "Resident", text(notice.title) || "New notice", summary, published, portalUrl("/notices")],
+      );
+      return { ...event, eventKey: `resident_notice_created:${entityId}:${text(resident.id)}` };
+    });
+}
+
+async function resolveLoginDetails(entityId: string) {
+  const { data: admission, error } = await supabaseAdmin
+    .from("admissions")
+    .select("id, resident_id, created_at")
+    .eq("id", entityId)
+    .maybeSingle();
+  if (error || !admission || !recent(admission.created_at)) throw new Error("event_unavailable");
+  const resident = await loadResident(text(admission.resident_id));
+  const email = text(resident.email).toLowerCase();
+  if (!email) throw new Error("recipient_unavailable");
+
+  const configuredSiteUrl = siteUrl();
+  const options = configuredSiteUrl
+    ? { redirectTo: `${configuredSiteUrl}/resident-portal/change-password` }
+    : undefined;
+  const { data: linkData, error: linkError } = await supabaseAdmin.auth.admin.generateLink({
+    type: "recovery",
+    email,
+    options,
+  });
+  if (linkError || !linkData.properties?.action_link) throw new Error("setup_link_unavailable");
+  const setupLink = linkData.properties.action_link;
+  const event = message(
+    "resident_login_details_sent",
+    entityId,
+    resident,
+    "Set up your StayHub Resident Portal password",
+    [
+      `Login email: ${email}`,
+      `Set or reset your password securely: ${setupLink}`,
+      `After setting your password, sign in at: ${portalUrl()}`,
+      "This setup link is private. Do not forward it.",
+    ],
+    [text(resident.full_name) || "Resident", email, setupLink, portalUrl()],
+  );
+  return event;
+}
+
 async function resolveEvent(eventType: NotificationEventType, entityId: string) {
   if (eventType === "admission_created") return resolveAdmission(entityId);
   if (eventType === "bill_generated") return resolveBill(entityId);
   if (eventType === "contract_approved") return resolveContract(entityId);
-  return resolveReceipt(eventType, entityId);
+  if (eventType === "resident_login_details_sent") return resolveLoginDetails(entityId);
+  if (eventType === "receipt_submitted" || eventType === "payment_verified" || eventType === "payment_rejected") {
+    return resolveReceipt(eventType, entityId);
+  }
+  throw new Error("event_unavailable");
 }
 
-async function sendEmail(event: EventMessage): Promise<ChannelStatus> {
-  if (!event.email) return "skipped";
+async function sendEmail(event: EventMessage): Promise<ChannelDelivery> {
   const apiKey = text(process.env.RESEND_API_KEY);
   const fromAddress = text(process.env.NOTIFICATION_EMAIL_FROM);
-  if (!apiKey || !fromAddress) return "configuration_required";
+  const configured = Boolean(apiKey && fromAddress);
+  if (!event.email) {
+    console.info("[notifications:diagnostic] Email delivery.", { configured, status: "skipped", errorMessage: "resident_email_missing" });
+    return { status: "skipped", providerMessageId: null };
+  }
+  if (!configured) {
+    console.info("[notifications:diagnostic] Email delivery.", { configured, status: "configuration_required", errorMessage: "resend_configuration_missing" });
+    return { status: "configuration_required", providerMessageId: null };
+  }
   const fromName = text(process.env.NOTIFICATION_EMAIL_FROM_NAME) || "StayHub";
   try {
     const response = await fetch("https://api.resend.com/emails", {
@@ -221,19 +353,36 @@ async function sendEmail(event: EventMessage): Promise<ChannelStatus> {
       headers: { Authorization: `Bearer ${apiKey}`, "Content-Type": "application/json", "Idempotency-Key": `${event.eventKey}:email` },
       body: JSON.stringify({ from: `${fromName} <${fromAddress}>`, to: [event.email], subject: event.subject, text: event.body, html: `<div style="font-family:Arial,sans-serif;white-space:pre-line">${escapeHtml(event.body)}</div>` }),
     });
-    return response.ok ? "sent" : "failed";
-  } catch {
-    return "failed";
+    const payload = (await response.json().catch(() => null)) as { id?: unknown; message?: unknown } | null;
+    console.info("[notifications:diagnostic] Email delivery.", {
+      configured,
+      status: response.ok ? "sent" : "failed",
+      errorMessage: response.ok ? null : text(payload?.message) || `resend_http_${response.status}`,
+    });
+    return {
+      status: response.ok ? "sent" : "failed",
+      providerMessageId: response.ok ? text(payload?.id) || null : null,
+    };
+  } catch (error) {
+    console.warn("[notifications:diagnostic] Email delivery.", { configured, status: "failed", errorMessage: safeErrorMessage(error) });
+    return { status: "failed", providerMessageId: null };
   }
 }
 
-async function sendWhatsApp(eventType: NotificationEventType, event: EventMessage): Promise<ChannelStatus> {
-  const recipient = normalizePhone(event.phone);
-  if (!recipient) return "skipped";
+async function sendWhatsApp(eventType: NotificationEventType, event: EventMessage): Promise<ChannelDelivery> {
   const token = text(process.env.WHATSAPP_ACCESS_TOKEN);
   const phoneId = text(process.env.WHATSAPP_PHONE_NUMBER_ID);
   const template = text(process.env[templateEnv[eventType]]);
-  if (!token || !phoneId || !template) return "configuration_required";
+  const configured = Boolean(token && phoneId && template);
+  const recipient = normalizePhone(event.phone);
+  if (!recipient) {
+    console.info("[notifications:diagnostic] WhatsApp delivery.", { configured, status: "skipped", errorMessage: "resident_phone_missing_or_invalid" });
+    return { status: "skipped", providerMessageId: null };
+  }
+  if (!configured) {
+    console.info("[notifications:diagnostic] WhatsApp delivery.", { configured, status: "configuration_required", errorMessage: "whatsapp_configuration_missing" });
+    return { status: "configuration_required", providerMessageId: null };
+  }
   const version = text(process.env.WHATSAPP_API_VERSION) || "v23.0";
   const language = text(process.env.WHATSAPP_TEMPLATE_LANGUAGE_CODE) || "en_US";
   try {
@@ -251,14 +400,36 @@ async function sendWhatsApp(eventType: NotificationEventType, event: EventMessag
         },
       }),
     });
-    return response.ok ? "sent" : "failed";
-  } catch {
-    return "failed";
+    const payload = (await response.json().catch(() => null)) as { messages?: Array<{ id?: unknown }>; error?: { message?: unknown } } | null;
+    console.info("[notifications:diagnostic] WhatsApp delivery.", {
+      configured,
+      status: response.ok ? "sent" : "failed",
+      errorMessage: response.ok ? null : text(payload?.error?.message) || `whatsapp_http_${response.status}`,
+    });
+    return {
+      status: response.ok ? "sent" : "failed",
+      providerMessageId: response.ok ? text(payload?.messages?.[0]?.id) || null : null,
+    };
+  } catch (error) {
+    console.warn("[notifications:diagnostic] WhatsApp delivery.", { configured, status: "failed", errorMessage: safeErrorMessage(error) });
+    return { status: "failed", providerMessageId: null };
   }
 }
 
-function publicResult(emailStatus: ChannelStatus, whatsappStatus: ChannelStatus): NotificationRequestResult {
-  const statuses = [emailStatus, whatsappStatus];
+async function sendSms(event: EventMessage): Promise<ChannelDelivery> {
+  const delivery: ChannelDelivery = event.phone
+    ? { status: "configuration_required", providerMessageId: null }
+    : { status: "skipped", providerMessageId: null };
+  console.info("[notifications:diagnostic] SMS delivery.", {
+    configured: false,
+    status: delivery.status,
+    errorMessage: event.phone ? "sms_provider_not_implemented" : "resident_phone_missing",
+  });
+  return delivery;
+}
+
+function publicResult(emailStatus: ChannelStatus, whatsappStatus: ChannelStatus, smsStatus: ChannelStatus = "skipped"): NotificationRequestResult {
+  const statuses = [emailStatus, whatsappStatus, smsStatus];
   return {
     delivered: statuses.includes("sent"),
     configurationRequired: statuses.includes("configuration_required"),
@@ -272,27 +443,37 @@ function publicResult(emailStatus: ChannelStatus, whatsappStatus: ChannelStatus)
 export async function notifyResidentEvent(
   eventType: NotificationEventType,
   entityId: string,
+  options: NotificationRequestOptions = {},
 ): Promise<NotificationRequestResult> {
   try {
-    const event = await resolveEvent(eventType, entityId);
+    const channels = [...new Set(options.channels?.length ? options.channels : defaultChannels)];
+    console.info("[notifications:diagnostic] Requested channels.", { eventType, channels });
+    const events = eventType === "resident_notice_created"
+      ? await resolveNotice(entityId, options.recipientIds ?? [])
+      : [await resolveEvent(eventType, entityId)];
+    const results: NotificationRequestResult[] = [];
+
+    for (const event of events) {
     const insert = await supabaseAdmin.from("notification_deliveries").insert({
       event_key: event.eventKey,
       event_type: eventType,
       entity_id: entityId,
       resident_id: event.residentId,
+      requested_channels: channels,
       status: "processing",
-    }).select("id, email_status, whatsapp_status, status, attempt_count").single();
+    }).select("id, email_status, whatsapp_status, sms_status, email_provider_message_id, whatsapp_provider_message_id, sms_provider_message_id, status, attempt_count").single();
 
     let delivery = insert.data;
     if (insert.error?.code === "23505") {
       const existing = await supabaseAdmin.from("notification_deliveries")
-        .select("id, email_status, whatsapp_status, status, attempt_count")
+        .select("id, email_status, whatsapp_status, sms_status, email_provider_message_id, whatsapp_provider_message_id, sms_provider_message_id, status, attempt_count")
         .eq("event_key", event.eventKey)
         .maybeSingle();
       if (existing.error || !existing.data) throw new Error("ledger_unavailable");
       delivery = existing.data;
       if (delivery.status === "processing" || delivery.status === "complete") {
-        return publicResult(delivery.email_status as ChannelStatus, delivery.whatsapp_status as ChannelStatus);
+        results.push(publicResult(delivery.email_status as ChannelStatus, delivery.whatsapp_status as ChannelStatus, delivery.sms_status as ChannelStatus));
+        continue;
       }
       const { data: reclaimed } = await supabaseAdmin
         .from("notification_deliveries")
@@ -306,10 +487,12 @@ export async function notifyResidentEvent(
         .select("id")
         .maybeSingle();
       if (!reclaimed) {
-        return publicResult(
+        results.push(publicResult(
           delivery.email_status as ChannelStatus,
           delivery.whatsapp_status as ChannelStatus,
-        );
+          delivery.sms_status as ChannelStatus,
+        ));
+        continue;
       }
     } else if (insert.error || !delivery) {
       throw new Error("ledger_unavailable");
@@ -317,14 +500,32 @@ export async function notifyResidentEvent(
 
     const priorEmail = delivery.email_status as ChannelStatus | null;
     const priorWhatsApp = delivery.whatsapp_status as ChannelStatus | null;
-    const emailStatus = priorEmail === "sent" || priorEmail === "skipped" ? priorEmail : await sendEmail(event);
-    const whatsappStatus = priorWhatsApp === "sent" || priorWhatsApp === "skipped" ? priorWhatsApp : await sendWhatsApp(eventType, event);
-    const result = publicResult(emailStatus, whatsappStatus);
-    const complete = [emailStatus, whatsappStatus].every((status) => status === "sent" || status === "skipped");
+    const priorSms = delivery.sms_status as ChannelStatus | null;
+    const emailDelivery = channels.includes("email")
+      ? priorEmail === "sent" || priorEmail === "skipped" ? { status: priorEmail, providerMessageId: text(delivery.email_provider_message_id) || null } : await sendEmail(event)
+      : { status: "skipped" as const, providerMessageId: null };
+    const whatsappDelivery = channels.includes("whatsapp")
+      ? priorWhatsApp === "sent" || priorWhatsApp === "skipped" ? { status: priorWhatsApp, providerMessageId: text(delivery.whatsapp_provider_message_id) || null } : await sendWhatsApp(eventType, event)
+      : { status: "skipped" as const, providerMessageId: null };
+    const smsDelivery = channels.includes("sms")
+      ? priorSms === "sent" || priorSms === "skipped" ? { status: priorSms, providerMessageId: text(delivery.sms_provider_message_id) || null } : await sendSms(event)
+      : { status: "skipped" as const, providerMessageId: null };
+    const result = publicResult(emailDelivery.status, whatsappDelivery.status, smsDelivery.status);
+    console.info("[notifications:diagnostic] Delivery statuses.", {
+      eventType,
+      emailStatus: emailDelivery.status,
+      whatsappStatus: whatsappDelivery.status,
+      smsStatus: smsDelivery.status,
+    });
+    const complete = [emailDelivery.status, whatsappDelivery.status, smsDelivery.status].every((status) => status === "sent" || status === "skipped");
 
     await supabaseAdmin.from("notification_deliveries").update({
-      email_status: emailStatus,
-      whatsapp_status: whatsappStatus,
+      email_status: emailDelivery.status,
+      whatsapp_status: whatsappDelivery.status,
+      sms_status: smsDelivery.status,
+      email_provider_message_id: emailDelivery.providerMessageId,
+      whatsapp_provider_message_id: whatsappDelivery.providerMessageId,
+      sms_provider_message_id: smsDelivery.providerMessageId,
       status: complete ? "complete" : result.delivered ? "partial" : result.configurationRequired ? "configuration_required" : "failed",
       last_error_code: result.warning ? "notification_delivery_incomplete" : null,
       completed_at: complete ? new Date().toISOString() : null,
@@ -332,11 +533,21 @@ export async function notifyResidentEvent(
     }).eq("id", delivery.id);
 
     if (result.warning) {
-      console.warn("[notifications] Delivery incomplete.", { eventType, entityId, emailStatus, whatsappStatus });
+      console.warn("[notifications] Delivery incomplete.", { eventType, emailStatus: emailDelivery.status, whatsappStatus: whatsappDelivery.status, smsStatus: smsDelivery.status });
     }
-    return result;
-  } catch {
-    console.warn("[notifications] Event notification could not be completed.", { eventType, entityId });
+    results.push(result);
+    }
+
+    const deliveredCount = results.filter((result) => result.delivered).length;
+    return {
+      delivered: deliveredCount > 0,
+      deliveredCount,
+      recipientCount: results.length,
+      configurationRequired: results.some((result) => result.configurationRequired),
+      warning: results.some((result) => result.warning),
+    };
+  } catch (error) {
+    console.warn("[notifications] Event notification could not be completed.", { eventType, errorMessage: safeErrorMessage(error) });
     return { delivered: false, configurationRequired: false, warning: true };
   }
 }

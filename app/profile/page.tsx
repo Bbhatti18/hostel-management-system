@@ -67,33 +67,29 @@ export default function AdminProfilePage() {
     setLoading(true);
     setError("");
 
-    const adminResult = await supabase
+    const { data: authData, error: authError } = await supabase.auth.getUser();
+    const authEmail = authData.user?.email;
+
+    if (authError || !authEmail) {
+      setError("Your authenticated profile could not be loaded. Please sign in again.");
+      setLoading(false);
+      return;
+    }
+
+    const profileResult = await supabase
       .from("staff_users")
       .select("*")
-      .ilike("role", "admin")
-      .limit(1)
+      .ilike("email", authEmail)
       .maybeSingle();
 
-    let selectedProfile = adminResult.data as UserRow | null;
-    let selectedError = adminResult.error;
-
-    if (!selectedProfile && !selectedError) {
-      const fallbackResult = await supabase
-        .from("staff_users")
-        .select("*")
-        .order("created_at", { ascending: true })
-        .limit(1)
-        .maybeSingle();
-
-      selectedProfile = fallbackResult.data as UserRow | null;
-      selectedError = fallbackResult.error;
-    }
+    const selectedProfile = profileResult.data as UserRow | null;
+    const selectedError = profileResult.error;
 
     if (selectedError) {
       setError(getSupabaseErrorMessage(selectedError, "The administrator profile could not be loaded."));
     } else if (!selectedProfile) {
       setError(
-        "No admin profile found. First create an admin user from Users & Roles."
+        "No staff profile is linked to your authenticated email."
       );
     } else {
       setProfile(selectedProfile);
@@ -159,7 +155,6 @@ export default function AdminProfilePage() {
 
     const payload = {
       full_name: form.full_name.trim(),
-      email: form.email.trim(),
       phone: form.phone.trim() || null,
       notes: form.notes.trim() || null,
       updated_at: new Date().toISOString(),
@@ -281,17 +276,17 @@ export default function AdminProfilePage() {
                         />
                       </Field>
 
-                      <Field label="Email *">
+                      <Field label="Email">
                         <input
-                          required
+                          readOnly
                           type="email"
                           value={form.email}
-                          onChange={(event) =>
-                            updateField("email", event.target.value)
-                          }
                           className={inputClass}
                           placeholder="admin@example.com"
                         />
+                        <span className="mt-1.5 block text-xs text-slate-500">
+                          Email is controlled by Supabase Auth.
+                        </span>
                       </Field>
 
                       <Field label="Phone">

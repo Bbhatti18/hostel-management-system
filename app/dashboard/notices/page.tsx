@@ -192,6 +192,7 @@ export default function NoticesPage() {
                 className="w-full rounded-lg border border-gray-300 px-3 py-2.5"
               >
                 <option value="All">All Statuses</option>
+                <option value="Published">Published</option>
                 <option value="Active">Active</option>
                 <option value="Draft">Draft</option>
                 <option value="Inactive">Inactive</option>
@@ -272,7 +273,7 @@ export default function NoticesPage() {
                   : "bg-blue-100 text-blue-700";
 
               const statusClass =
-                notice.status === "Active"
+                notice.status === "Active" || notice.status === "Published"
                   ? "bg-green-100 text-green-700"
                   : notice.status === "Draft"
                   ? "bg-yellow-100 text-yellow-700"

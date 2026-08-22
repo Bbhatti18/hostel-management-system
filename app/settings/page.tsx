@@ -1,5 +1,6 @@
 "use client";
 
+import Link from "next/link";
 import {
   FormEvent,
   ReactNode,
@@ -7,6 +8,7 @@ import {
   useEffect,
   useState,
 } from "react";
+import { isActiveAdmin } from "@/lib/adminRoles";
 import { supabase } from "@/lib/supabase";
 import { getSupabaseErrorMessage } from "@/lib/supabaseErrors";
 
@@ -68,6 +70,7 @@ export default function SettingsPage() {
   const [saving, setSaving] = useState(false);
   const [message, setMessage] = useState("");
   const [error, setError] = useState("");
+  const [showAdminTools, setShowAdminTools] = useState(false);
 
   const loadSettings = useCallback(async () => {
     setLoading(true);
@@ -114,6 +117,18 @@ export default function SettingsPage() {
         backup_frequency: data.backup_frequency ?? "Weekly",
         notes: data.notes ?? "",
       });
+    }
+
+    const { data: authData } = await supabase.auth.getUser();
+    if (authData.user?.email) {
+      const { data: staff } = await supabase
+        .from("staff_users")
+        .select("role, status")
+        .ilike("email", authData.user.email)
+        .maybeSingle();
+      setShowAdminTools(isActiveAdmin(staff?.role, staff?.status));
+    } else {
+      setShowAdminTools(false);
     }
 
     setLoading(false);
@@ -464,6 +479,30 @@ export default function SettingsPage() {
             </Field>
           </Section>
 
+          {showAdminTools && (
+            <section className="rounded-3xl border border-amber-200 bg-white p-6 shadow-sm">
+              <div className="flex flex-col gap-5 sm:flex-row sm:items-center sm:justify-between">
+                <div className="flex items-start gap-4">
+                  <span className="flex h-12 w-12 shrink-0 items-center justify-center rounded-2xl bg-amber-100 text-amber-700">
+                    <AdminToolsIcon />
+                  </span>
+                  <div>
+                    <h2 className="text-xl font-bold text-slate-900">Admin Tools</h2>
+                    <p className="mt-2 text-sm leading-6 text-slate-600">
+                      Manage destructive maintenance actions and system resets.
+                    </p>
+                  </div>
+                </div>
+                <Link
+                  href="/dashboard/settings/data-management"
+                  className="inline-flex shrink-0 items-center justify-center rounded-xl bg-amber-600 px-5 py-3 text-sm font-bold text-white transition hover:bg-amber-700 focus:outline-none focus:ring-4 focus:ring-amber-200"
+                >
+                  Open Admin Data Management
+                </Link>
+              </div>
+            </section>
+          )}
+
           <div className="flex justify-end">
             <button
               type="submit"
@@ -476,6 +515,15 @@ export default function SettingsPage() {
         </form>
       </div>
     </main>
+  );
+}
+
+function AdminToolsIcon() {
+  return (
+    <svg className="h-6 w-6" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" aria-hidden="true">
+      <path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10Z" />
+      <path d="M9 12h6M12 9v6" />
+    </svg>
   );
 }
 

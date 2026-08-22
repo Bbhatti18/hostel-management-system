@@ -4,6 +4,8 @@ import { useCallback, useEffect, useMemo, useState, type ReactNode } from "react
 import { useRouter } from "next/navigation";
 import Link from "next/link";
 import ResidentNoticePopup from "@/components/notices/ResidentNoticePopup";
+import FinancialSummary from "@/components/resident/FinancialSummary";
+import PaymentHistory from "@/components/resident/PaymentHistory";
 import { supabase } from "@/lib/supabase";
 import { normalizeBedLabel } from "@/lib/bedLabels";
 import {
@@ -95,6 +97,7 @@ export default function ResidentPortalPage() {
   const [contract, setContract] = useState<GenericRow | null>(null);
   const [bills, setBills] = useState<GenericRow[]>([]);
   const [payments, setPayments] = useState<GenericRow[]>([]);
+  const [receipts, setReceipts] = useState<GenericRow[]>([]);
   const [notices, setNotices] = useState<PortalNotice[]>([]);
   const [inspections, setInspections] = useState<GenericRow[]>([]);
   const [maintenance, setMaintenance] = useState<GenericRow[]>([]);
@@ -123,6 +126,7 @@ export default function ResidentPortalPage() {
 
     const [
       noticesResult,
+      noticeRecipientsResult,
       inspectionsResult,
       maintenanceResult,
     ] = await Promise.all([
@@ -132,6 +136,10 @@ export default function ResidentPortalPage() {
         .eq("status", "Published")
         .order("pinned", { ascending: false })
         .order("publish_date", { ascending: false }),
+      supabase
+        .from("notice_recipients")
+        .select("notice_id")
+        .eq("resident_id", residentId),
       supabase
         .from("room_inspections")
         .select("*")
@@ -146,10 +154,24 @@ export default function ResidentPortalPage() {
 
     const activeAdmission = protectedData.admission;
 
+    if (
+      noticesResult.error ||
+      noticeRecipientsResult.error ||
+      inspectionsResult.error ||
+      maintenanceResult.error
+    ) {
+      setError("Your portal activity could not be loaded. Please refresh and try again.");
+      setLoading(false);
+      return;
+    }
+
     const currentRoomId = firstText(activeAdmission, ["room_id"]);
+    const selectedNoticeIds = new Set(
+      (noticeRecipientsResult.data ?? []).map((row) => text(row.notice_id)),
+    );
     const filteredNotices = ((noticesResult.data ?? []) as PortalNotice[]).filter(
       (notice) =>
-        isNoticeVisibleToResident(notice, residentId, currentRoomId),
+        isNoticeVisibleToResident(notice, residentId, currentRoomId, undefined, selectedNoticeIds),
     );
 
     setResident(protectedData.resident);
@@ -159,6 +181,7 @@ export default function ResidentPortalPage() {
     setContract(protectedData.contract);
     setBills(protectedData.bills);
     setPayments(protectedData.payments);
+    setReceipts(protectedData.receipts);
     setNotices(filteredNotices);
     setInspections((inspectionsResult.data ?? []) as GenericRow[]);
     setMaintenance((maintenanceResult.data ?? []) as GenericRow[]);
@@ -238,33 +261,6 @@ export default function ResidentPortalPage() {
     }
     return totals;
   }, [payments]);
-
-  const pendingBalance = useMemo(
-    () =>
-      bills
-        .filter(
-          (bill) =>
-            firstText(bill, ["bill_status", "status"])
-              .trim()
-              .toLowerCase() !== "cancelled"
-        )
-        .reduce(
-          (sum, bill) =>
-            sum +
-            Math.max(
-              Number(bill.total_amount || 0) -
-                (verifiedByBill.get(text(bill.id)) ?? 0),
-              0
-            ),
-          0
-        ),
-    [bills, verifiedByBill]
-  );
-
-  const verifiedPayments = useMemo(
-    () => [...verifiedByBill.values()].reduce((sum, amount) => sum + amount, 0),
-    [verifiedByBill]
-  );
 
   if (loading) {
     return (
@@ -405,15 +401,7 @@ export default function ResidentPortalPage() {
                   </p>
                 </Card>
               )}
-              <div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-4">
-                <StatCard label="Pending Bill Balance" value={money(pendingBalance)} />
-                <StatCard label="Verified Payments" value={money(verifiedPayments)} />
-                <StatCard label="Room" value={roomName(room)} />
-                <StatCard
-                  label="Deposit Status"
-                  value={firstText(admission, ["deposit_status"]) || "Not recorded"}
-                />
-              </div>
+              <div id="financial-summary"><FinancialSummary admission={admission} room={room} bed={bed} bills={bills} payments={payments} /></div>
 
               <Card title="Current Admission">
                 <InfoGrid
@@ -554,24 +542,18 @@ export default function ResidentPortalPage() {
           )}
 
           {activeTab === "Payments" && (
-            <Card title="Payment History">
-              <DataTable
-                headers={["Payment No.", "Date", "Method", "Reference", "Amount", "Status"]}
-                rows={payments.map((payment) => [
-                  firstText(payment, ["payment_number"]) || "—",
-                  firstText(payment, ["payment_date", "created_at"]).slice(0, 10) || "—",
-                  firstText(payment, ["payment_method"]) || "Payment Method",
-                  firstText(payment, ["reference_number"]) || "—",
-                  money(payment.amount),
-                  firstText(payment, ["payment_status", "status"]) || "Pending",
-                ])}
-              />
-              {!isReadOnlyView && (
-                <Link href="/resident-portal/payments" className="mt-5 inline-flex rounded-xl bg-indigo-600 px-5 py-3 text-sm font-semibold text-white">
-                  View Full Payment & Receipt History
-                </Link>
-              )}
-            </Card>
+            <PaymentHistory
+              admission={admission}
+              room={room}
+              bed={bed}
+              bills={bills}
+              payments={payments}
+              receipts={receipts}
+              onViewFinancialSummary={() => {
+                setActiveTab("Overview");
+                window.setTimeout(() => document.getElementById("financial-summary")?.scrollIntoView({ behavior: "smooth", block: "start" }), 0);
+              }}
+            />
           )}
 
           {activeTab === "Notices" && (
@@ -660,15 +642,6 @@ function Card({ title, children }: { title: string; children: ReactNode }) {
   );
 }
 
-
-function StatCard({ label, value }: { label: string; value: string }) {
-  return (
-    <article className="rounded-2xl border border-slate-200 bg-white p-5 shadow-sm">
-      <p className="text-sm font-medium text-slate-500">{label}</p>
-      <p className="mt-2 text-2xl font-bold text-slate-900">{value}</p>
-    </article>
-  );
-}
 
 function InfoGrid({ items }: { items: [string, string][] }) {
   return (

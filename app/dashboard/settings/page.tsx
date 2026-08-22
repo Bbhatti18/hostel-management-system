@@ -131,6 +131,27 @@ const settingsItems: SettingsItem[] = [
     ),
     status: "Manual",
   },
+  {
+    title: "Hostel Data Management",
+    description:
+      "Securely reset operational data or permanently remove one resident and linked records.",
+    href: "/dashboard/settings/data-management",
+    icon: (
+      <svg
+        viewBox="0 0 24 24"
+        fill="none"
+        stroke="currentColor"
+        strokeWidth="1.8"
+        className="h-6 w-6"
+      >
+        <path d="M3 6h18" />
+        <path d="M8 6V4h8v2" />
+        <path d="m19 6-1 15H6L5 6" />
+        <path d="M10 11v5M14 11v5" />
+      </svg>
+    ),
+    status: "Admin Only",
+  },
 ];
 
 export default function SettingsPage() {

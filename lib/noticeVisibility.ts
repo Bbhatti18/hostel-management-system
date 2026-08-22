@@ -23,6 +23,7 @@ export function isNoticeVisibleToResident(
   residentId: string,
   roomId: string,
   currentDate = currentNoticeDate(),
+  selectedNoticeIds: ReadonlySet<string> = new Set(),
 ) {
   if (normalized(notice.status) !== "published" || notice.is_active === false) {
     return false;
@@ -35,6 +36,7 @@ export function isNoticeVisibleToResident(
   const target = normalized(notice.target_audience);
 
   if (["all residents", "all", "residents"].includes(audience)) return true;
+  if (audience === "selected residents") return selectedNoticeIds.has(String(notice.id));
   if (!audience && target === "all") return true;
   if (
     audience === "specific resident" ||

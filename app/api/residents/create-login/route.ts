@@ -1,6 +1,5 @@
 import { NextRequest, NextResponse } from "next/server";
 import { createClient } from "@supabase/supabase-js";
-import { supabaseAdmin } from "@/lib/supabaseAdmin";
 
 const ALLOWED_STAFF_ROLES = new Set([
   "super admin",
@@ -27,8 +26,28 @@ function bearerToken(request: NextRequest) {
     : "";
 }
 
+function jsonError(error: string, status: number) {
+  return NextResponse.json(
+    { error },
+    { status, headers: { "Cache-Control": "private, no-store" } },
+  );
+}
+
+function serverErrorMessage(error: unknown, fallback: string) {
+  return error instanceof Error && error.message.trim()
+    ? error.message
+    : fallback;
+}
+
+function normalized(value: unknown) {
+  return String(value ?? "").trim().toLowerCase();
+}
+
 export async function POST(request: NextRequest) {
   try {
+    console.info("[resident-login:diagnostic] Authorization header present.", {
+      present: request.headers.has("authorization"),
+    });
     const token = bearerToken(request);
     if (!token) {
       return NextResponse.json(
@@ -39,46 +58,92 @@ export async function POST(request: NextRequest) {
 
     const supabaseUrl = process.env.NEXT_PUBLIC_SUPABASE_URL;
     const anonKey = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY;
-    if (!supabaseUrl || !anonKey) {
-      return NextResponse.json(
-        { error: "Supabase server configuration is incomplete." },
-        { status: 500 },
-      );
+    const serviceRoleKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
+    if (!supabaseUrl || !anonKey || !serviceRoleKey) {
+      console.info("[resident-login:diagnostic] Supabase admin client initialized.", {
+        initialized: false,
+      });
     }
+    if (!supabaseUrl) return jsonError("NEXT_PUBLIC_SUPABASE_URL is not configured on the server.", 500);
+    if (!anonKey) return jsonError("NEXT_PUBLIC_SUPABASE_ANON_KEY is not configured on the server.", 500);
+    if (!serviceRoleKey) return jsonError("SUPABASE_SERVICE_ROLE_KEY is not configured on the server.", 500);
 
     const authClient = createClient(supabaseUrl, anonKey, {
       auth: { persistSession: false, autoRefreshToken: false },
+    });
+    console.log({
+      serviceKeyExists: Boolean(process.env.SUPABASE_SERVICE_ROLE_KEY),
+      serviceKeyPrefix: process.env.SUPABASE_SERVICE_ROLE_KEY?.slice(0, 10),
+      serviceKeyLength: process.env.SUPABASE_SERVICE_ROLE_KEY?.length,
+      supabaseUrl: process.env.NEXT_PUBLIC_SUPABASE_URL,
+    });
+    const supabaseAdmin = createClient(supabaseUrl, serviceRoleKey, {
+      auth: {
+        persistSession: false,
+        autoRefreshToken: false,
+        detectSessionInUrl: false,
+      },
+    });
+    console.info("[resident-login:diagnostic] Supabase admin client initialized.", {
+      initialized: true,
     });
 
     const { data: authData, error: authError } =
       await authClient.auth.getUser(token);
     const staffEmail = authData.user?.email?.trim().toLowerCase();
+    console.info("[resident-login:diagnostic] getUser completed.", {
+      success: !authError && Boolean(staffEmail),
+      failure: authError ? "supabase_get_user_failed" : !staffEmail ? "authenticated_user_email_missing" : null,
+    });
 
     if (authError || !staffEmail) {
-      return NextResponse.json(
-        { error: "Your admin session could not be verified." },
-        { status: 401 },
+      return jsonError(
+        authError?.message || "Your admin session could not be verified.",
+        401,
       );
     }
 
-    const { data: staff, error: staffError } = await supabaseAdmin
+    const { data: staffRows, error: staffError } = await supabaseAdmin
       .from("staff_users")
-      .select("id, email, role, status")
-      .ilike("email", staffEmail)
-      .maybeSingle();
+      .select("id, email, role, status");
+    const matchingStaff = (staffRows ?? []).filter(
+      (staffRecord) => normalized(staffRecord.email) === staffEmail,
+    );
+    const staffUser = matchingStaff.length === 1 ? matchingStaff[0] : null;
+    console.log({
+      staffFound: Boolean(staffUser),
+      queryError: staffError?.message,
+    });
+    console.info("[resident-login:diagnostic] Staff lookup completed.", {
+      email: staffEmail,
+      found: Boolean(staffUser),
+    });
 
-    const staffRole = String(staff?.role ?? "").trim().toLowerCase();
-    const staffStatus = String(staff?.status ?? "").trim().toLowerCase();
+    const staffRole = normalized(staffUser?.role);
+    const staffStatus = normalized(staffUser?.status);
 
     if (
       staffError ||
-      !staff ||
+      !staffUser ||
       staffStatus !== "active" ||
       !ALLOWED_STAFF_ROLES.has(staffRole)
     ) {
-      return NextResponse.json(
-        { error: "You do not have permission to create resident logins." },
-        { status: 403 },
+      const forbiddenReason = staffError
+        ? "staff_lookup_failed"
+        : matchingStaff.length > 1
+          ? "multiple_staff_users_match"
+        : !staffUser
+          ? "staff_user_not_found"
+          : staffStatus !== "active"
+            ? "staff_user_not_active"
+            : "staff_role_not_allowed";
+      console.warn("[resident-login:diagnostic] Returning 403.", {
+        email: staffEmail,
+        reason: forbiddenReason,
+      });
+      return jsonError(
+        staffError?.message || "You do not have permission to create resident logins.",
+        403,
       );
     }
 
@@ -102,9 +167,11 @@ export async function POST(request: NextRequest) {
       .maybeSingle();
 
     if (residentError || !resident) {
-      return NextResponse.json(
-        { error: "The resident profile could not be verified." },
-        { status: 404 },
+      return jsonError(
+        residentError
+          ? `The resident profile could not be verified: ${residentError.message}`
+          : "The resident profile could not be found.",
+        residentError ? 500 : 404,
       );
     }
 
@@ -131,10 +198,8 @@ export async function POST(request: NextRequest) {
         await supabaseAdmin.auth.admin.listUsers({ page, perPage: 1000 });
 
       if (usersError) {
-        return NextResponse.json(
-          { error: "Existing portal accounts could not be checked." },
-          { status: 500 },
-        );
+        console.error("[resident-login] Supabase Auth users could not be listed.", usersError);
+        return jsonError(`Existing portal accounts could not be checked: ${usersError.message}`, 500);
       }
 
       existingUser =
@@ -178,9 +243,10 @@ export async function POST(request: NextRequest) {
         });
       }
 
-      return NextResponse.json(
-        { error: "The resident was saved, but the portal login could not be created." },
-        { status: 500 },
+      console.error("[resident-login] Supabase Auth account creation failed.", createError);
+      return jsonError(
+        `Supabase Auth could not create the resident portal account: ${createError?.message || "No auth user was returned."}`,
+        500,
       );
     }
 
@@ -189,10 +255,11 @@ export async function POST(request: NextRequest) {
       email,
       temporaryPassword,
     });
-  } catch {
-    return NextResponse.json(
-      { error: "Unable to create the resident portal login." },
-      { status: 500 },
+  } catch (error) {
+    console.error("[resident-login] Unexpected portal account creation failure.", error);
+    return jsonError(
+      `Unable to create the resident portal login: ${serverErrorMessage(error, "Unexpected server error.")}`,
+      500,
     );
   }
 }

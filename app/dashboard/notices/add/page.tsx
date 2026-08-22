@@ -9,9 +9,12 @@ import {
 import Link from "next/link";
 import { useRouter } from "next/navigation";
 import { supabase } from "@/lib/supabase";
+import { notificationWarning, requestEventNotification } from "@/lib/notifications/client";
+import type { NotificationChannel } from "@/lib/notifications/types";
 
 type AudienceType =
   | "All Residents"
+  | "Selected Residents"
   | "Specific Room"
   | "Specific Resident"
   | "Staff";
@@ -23,12 +26,13 @@ type PriorityType =
   | "Urgent";
 
 type StatusType =
+  | "Published"
   | "Active"
   | "Draft"
   | "Inactive";
 
 type GenericRecord = {
-  id: number;
+  id: string | number;
   [key: string]:
     | string
     | number
@@ -89,7 +93,11 @@ export default function AddNoticePage() {
     useState(false);
 
   const [status, setStatus] =
-    useState<StatusType>("Active");
+    useState<StatusType>("Published");
+  const [residentSearch, setResidentSearch] = useState("");
+  const [selectedResidentIds, setSelectedResidentIds] = useState<string[]>([]);
+  const [communicationChannels, setCommunicationChannels] =
+    useState<NotificationChannel[]>(["email", "whatsapp"]);
 
   const [loading, setLoading] =
     useState(true);
@@ -123,7 +131,11 @@ export default function AddNoticePage() {
   }, [rooms]);
 
   const residentOptions = useMemo(() => {
-    return residents.map((resident) => {
+    const query = residentSearch.trim().toLowerCase();
+    return residents.filter((resident) => {
+      const searchable = `${resident.full_name ?? resident.name ?? ""} ${resident.email ?? ""} ${resident.phone ?? ""}`.toLowerCase();
+      return String(resident.status ?? "").toLowerCase() !== "archived" && (!query || searchable.includes(query));
+    }).map((resident) => {
       const combinedName = [
         resident.first_name,
         resident.last_name,
@@ -147,7 +159,7 @@ export default function AddNoticePage() {
         label: `${name}${phone}`,
       };
     });
-  }, [residents]);
+  }, [residentSearch, residents]);
 
   const staffOptions = useMemo(() => {
     return staffMembers.map((member) => {
@@ -252,9 +264,26 @@ export default function AddNoticePage() {
     setAudience(value);
     setRoomId("");
     setResidentId("");
+    setSelectedResidentIds([]);
     setStaffId("");
     setErrorMessage("");
     setSuccessMessage("");
+  };
+
+  const toggleResident = (id: string) => {
+    setSelectedResidentIds((current) =>
+      current.includes(id)
+        ? current.filter((residentId) => residentId !== id)
+        : [...current, id],
+    );
+  };
+
+  const toggleChannel = (channel: NotificationChannel) => {
+    setCommunicationChannels((current) =>
+      current.includes(channel)
+        ? current.filter((item) => item !== channel)
+        : [...current, channel],
+    );
   };
   const handleSubmit = async (
     event: FormEvent<HTMLFormElement>
@@ -289,12 +318,24 @@ export default function AddNoticePage() {
     }
 
     if (
+      audience === "Selected Residents" &&
+      selectedResidentIds.length === 0
+    ) {
+      setErrorMessage("Please select at least one resident.");
+      return;
+    }
+
+    if (
       audience === "Specific Resident" &&
       !residentId
     ) {
       setErrorMessage(
         "Please select a resident."
       );
+      return;
+    }
+    if (communicationChannels.length === 0) {
+      setErrorMessage("Select at least one communication channel.");
       return;
     }
 
@@ -310,7 +351,7 @@ export default function AddNoticePage() {
 
     setSaving(true);
 
-    const { error } =
+    const { data: createdNotice, error } =
       await supabase
         .from("notices")
         .insert({
@@ -325,18 +366,18 @@ export default function AddNoticePage() {
           room_id:
             audience ===
             "Specific Room"
-              ? Number(roomId)
+              ? roomId
               : null,
 
           resident_id:
             audience ===
             "Specific Resident"
-              ? Number(residentId)
+              ? residentId
               : null,
 
           staff_id:
             audience === "Staff"
-              ? Number(staffId)
+              ? staffId
               : null,
 
           attachment_url:
@@ -352,7 +393,18 @@ export default function AddNoticePage() {
           pinned,
 
           status,
-        });
+          notification_recipient_type:
+            audience === "All Residents"
+              ? "all_active_residents"
+              : audience === "Selected Residents"
+                ? "selected_residents"
+                : audience === "Specific Resident"
+                  ? "individual_resident"
+                  : null,
+          notification_channels: communicationChannels,
+        })
+        .select("id")
+        .single();
 
     if (error) {
       setErrorMessage(
@@ -362,8 +414,36 @@ export default function AddNoticePage() {
       return;
     }
 
+    if (audience === "Selected Residents") {
+      const { error: recipientError } = await supabase
+        .from("notice_recipients")
+        .insert(selectedResidentIds.map((selectedId) => ({
+          notice_id: createdNotice.id,
+          resident_id: selectedId,
+        })));
+      if (recipientError) {
+        setErrorMessage(`Notice was created, but its selected recipients could not be saved: ${recipientError.message}`);
+        setSaving(false);
+        return;
+      }
+    }
+
+    const notificationResult = await requestEventNotification(
+      "resident_notice_created",
+      String(createdNotice.id),
+      {
+        channels: communicationChannels,
+        recipientIds:
+          audience === "Selected Residents"
+            ? selectedResidentIds
+            : audience === "Specific Resident"
+              ? [residentId]
+              : undefined,
+      },
+    );
+
     setSuccessMessage(
-      "Notice created successfully."
+      `Notice created successfully for ${notificationResult.recipientCount ?? 0} resident(s).${notificationWarning(notificationResult)}`
     );
 
     setTimeout(() => {
@@ -494,37 +574,68 @@ export default function AddNoticePage() {
               </select>
             </div>
 
-            <div>
-              <label className="mb-2 block text-sm font-medium text-gray-700">
-                Audience
-              </label>
+            <fieldset className="md:col-span-2">
+              <legend className="mb-2 block text-sm font-medium text-gray-700">
+                Recipient Type
+              </legend>
+              <div className="grid gap-3 rounded-lg border border-gray-200 p-4 sm:grid-cols-3">
+                {(
+                  [
+                    ["All Residents", "All Active Residents"],
+                    ["Selected Residents", "Selected Residents"],
+                    ["Specific Resident", "Individual Resident"],
+                  ] as const
+                ).map(([value, label]) => (
+                  <label key={value} className="flex items-center gap-2 text-sm font-medium text-gray-700">
+                    <input
+                      type="radio"
+                      name="recipient-type"
+                      checked={audience === value}
+                      onChange={() => handleAudienceChange(value)}
+                      className="h-4 w-4 text-blue-600"
+                    />
+                    {label}
+                  </label>
+                ))}
+              </div>
+            </fieldset>
 
-              <select
-                value={audience}
-                onChange={(event) =>
-                  handleAudienceChange(
-                    event.target.value as AudienceType
-                  )
-                }
-                className="w-full rounded-lg border border-gray-300 px-3 py-2.5"
-              >
-                <option value="All Residents">
-                  All Residents
-                </option>
-
-                <option value="Specific Room">
-                  Specific Room
-                </option>
-
-                <option value="Specific Resident">
-                  Specific Resident
-                </option>
-
-                <option value="Staff">
-                  Staff
-                </option>
-              </select>
-            </div>
+            {audience === "Selected Residents" && (
+              <div className="md:col-span-2">
+                <label className="mb-2 block text-sm font-medium text-gray-700" htmlFor="resident-search">
+                  Search and select residents
+                </label>
+                <input
+                  id="resident-search"
+                  type="search"
+                  value={residentSearch}
+                  onChange={(event) => setResidentSearch(event.target.value)}
+                  placeholder="Search by name, email, or phone"
+                  className="w-full rounded-lg border border-gray-300 px-3 py-2.5"
+                />
+                <div className="mt-3 max-h-64 space-y-2 overflow-y-auto rounded-lg border border-gray-200 p-3">
+                  {residentOptions.length === 0 ? (
+                    <p className="text-sm text-gray-500">No matching active residents.</p>
+                  ) : residentOptions.map((resident) => {
+                    const id = String(resident.value);
+                    return (
+                      <label key={id} className="flex items-center gap-3 rounded-lg px-2 py-2 text-sm hover:bg-gray-50">
+                        <input
+                          type="checkbox"
+                          checked={selectedResidentIds.includes(id)}
+                          onChange={() => toggleResident(id)}
+                          className="h-4 w-4 rounded border-gray-300 text-blue-600"
+                        />
+                        {resident.label}
+                      </label>
+                    );
+                  })}
+                </div>
+                <p className="mt-2 text-sm font-medium text-blue-700">
+                  {selectedResidentIds.length} resident(s) selected
+                </p>
+              </div>
+            )}
 
             {audience === "Specific Room" && (
               <div className="md:col-span-2">
@@ -625,6 +736,34 @@ export default function AddNoticePage() {
               </div>
             )}
 
+            <fieldset className="md:col-span-2">
+              <legend className="mb-2 block text-sm font-medium text-gray-700">
+                Communication Channels
+              </legend>
+              <div className="flex flex-wrap gap-4 rounded-lg border border-gray-200 p-4">
+                {(
+                  [
+                    ["whatsapp", "WhatsApp"],
+                    ["email", "Email"],
+                    ["sms", "SMS / Text Message"],
+                  ] as const
+                ).map(([channel, label]) => (
+                  <label key={channel} className="flex items-center gap-2 text-sm font-medium text-gray-700">
+                    <input
+                      type="checkbox"
+                      checked={communicationChannels.includes(channel)}
+                      onChange={() => toggleChannel(channel)}
+                      className="h-4 w-4 rounded border-gray-300 text-blue-600"
+                    />
+                    {label}
+                  </label>
+                ))}
+              </div>
+              <p className="mt-2 text-xs text-gray-500">
+                SMS is tracked as a future channel until an SMS provider is configured.
+              </p>
+            </fieldset>
+
             <div className="md:col-span-2">
               <label className="mb-2 block text-sm font-medium text-gray-700">
                 Attachment URL
@@ -688,6 +827,9 @@ export default function AddNoticePage() {
                 }
                 className="w-full rounded-lg border border-gray-300 px-3 py-2.5"
               >
+                <option value="Published">
+                  Published
+                </option>
                 <option value="Active">
                   Active
                 </option>

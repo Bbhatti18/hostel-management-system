@@ -13,6 +13,7 @@ import {
   notificationWarning,
   requestEventNotification,
 } from "@/lib/notifications/client";
+import type { NotificationChannel } from "@/lib/notifications/types";
 import { getSupabaseErrorMessage } from "@/lib/supabaseErrors";
 import {
   compareBedRecordsAscending,
@@ -118,6 +119,16 @@ export default function AdmissionForm({
     useState<ResidentForm>(emptyResidentForm);
   const [savingResident, setSavingResident] = useState(false);
   const [residentError, setResidentError] = useState("");
+  const [communicationChannels, setCommunicationChannels] =
+    useState<NotificationChannel[]>(["email", "whatsapp"]);
+
+  function toggleCommunicationChannel(channel: NotificationChannel) {
+    setCommunicationChannels((current) =>
+      current.includes(channel)
+        ? current.filter((item) => item !== channel)
+        : [...current, channel],
+    );
+  }
 
   const loadResidents = useCallback(async () => {
     const { data, error: residentLoadError } = await supabase
@@ -354,6 +365,11 @@ export default function AdmissionForm({
     }
     if (Number(securityDeposit || 0) < 0) {
       setError("Security deposit cannot be negative.");
+      setSaving(false);
+      return;
+    }
+    if (communicationChannels.length === 0) {
+      setError("Select at least one communication channel for resident access details.");
       setSaving(false);
       return;
     }
@@ -609,6 +625,12 @@ export default function AdmissionForm({
       const notificationResult = await requestEventNotification(
         "admission_created",
         admissionData.id,
+        { channels: communicationChannels },
+      );
+      const loginNotificationResult = await requestEventNotification(
+        "resident_login_details_sent",
+        admissionData.id,
+        { channels: communicationChannels },
       );
 
       setResidentId("");
@@ -623,7 +645,7 @@ export default function AdmissionForm({
           portalLogin.created && portalLogin.temporaryPassword
             ? ` Portal login: ${portalLogin.email} | Temporary password: ${portalLogin.temporaryPassword}`
             : ` Portal access is ready for ${portalLogin.email}.`
-        }${notificationWarning(notificationResult)}`,
+        }${notificationWarning(notificationResult)}${notificationWarning(loginNotificationResult)}`,
       );
       await Promise.all([loadRoomsAndBeds(), onSaved()]);
     } catch (saveError) {
@@ -791,6 +813,35 @@ export default function AdmissionForm({
                 and preserved in this resident&apos;s contract snapshot.
               </span>
             </label>
+
+            <fieldset className="md:col-span-2 xl:col-span-4">
+              <legend className="mb-2 block text-sm font-semibold text-slate-700">
+                Send resident access details via *
+              </legend>
+              <div className="flex flex-wrap gap-4 rounded-xl border border-slate-200 bg-slate-50 p-4">
+                {(
+                  [
+                    ["whatsapp", "WhatsApp"],
+                    ["email", "Email"],
+                    ["sms", "SMS / Text Message"],
+                  ] as const
+                ).map(([channel, label]) => (
+                  <label key={channel} className="flex items-center gap-2 text-sm font-medium text-slate-700">
+                    <input
+                      type="checkbox"
+                      checked={communicationChannels.includes(channel)}
+                      onChange={() => toggleCommunicationChannel(channel)}
+                      disabled={loading || saving}
+                      className="h-4 w-4 rounded border-slate-300 text-indigo-600"
+                    />
+                    {label}
+                  </label>
+                ))}
+              </div>
+              <p className="mt-2 text-xs text-slate-500">
+                Email and WhatsApp use the configured providers. SMS delivery is logged as configuration required until an SMS provider is connected.
+              </p>
+            </fieldset>
           </div>
 
           <div className="flex justify-end border-t border-slate-200 pt-5">

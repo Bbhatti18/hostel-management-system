@@ -1,5 +1,5 @@
 import { supabase } from "@/lib/supabase";
-import type { NotificationEventType, NotificationRequestResult } from "@/lib/notifications/types";
+import type { NotificationEventType, NotificationRequestOptions, NotificationRequestResult } from "@/lib/notifications/types";
 
 const failedResult: NotificationRequestResult = {
   delivered: false,
@@ -10,6 +10,7 @@ const failedResult: NotificationRequestResult = {
 export async function requestEventNotification(
   eventType: NotificationEventType,
   entityId: string,
+  options: NotificationRequestOptions = {},
 ): Promise<NotificationRequestResult> {
   try {
     let { data } = await supabase.auth.getSession();
@@ -26,7 +27,7 @@ export async function requestEventNotification(
         "Content-Type": "application/json",
         Authorization: `Bearer ${accessToken}`,
       },
-      body: JSON.stringify({ eventType, entityId }),
+      body: JSON.stringify({ eventType, entityId, ...options }),
     });
     if (!response.ok) return failedResult;
 
@@ -35,6 +36,8 @@ export async function requestEventNotification(
       delivered: payload?.delivered === true,
       configurationRequired: payload?.configurationRequired === true,
       warning: payload?.warning === true,
+      recipientCount: typeof payload?.recipientCount === "number" ? payload.recipientCount : undefined,
+      deliveredCount: typeof payload?.deliveredCount === "number" ? payload.deliveredCount : undefined,
     };
   } catch {
     return failedResult;

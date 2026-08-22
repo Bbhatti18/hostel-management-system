@@ -15,6 +15,7 @@ any provider setting with a NEXT_PUBLIC_ prefix.
     RESEND_API_KEY=
     NOTIFICATION_EMAIL_FROM=
     NOTIFICATION_EMAIL_FROM_NAME=StayHub
+    NEXT_PUBLIC_SITE_URL=https://your-stayhub-domain.example
 
     WHATSAPP_ACCESS_TOKEN=
     WHATSAPP_PHONE_NUMBER_ID=
@@ -28,6 +29,8 @@ any provider setting with a NEXT_PUBLIC_ prefix.
     WHATSAPP_TEMPLATE_PAYMENT_VERIFIED=
     WHATSAPP_TEMPLATE_PAYMENT_REJECTED=
     WHATSAPP_TEMPLATE_CONTRACT_APPROVED=
+    WHATSAPP_TEMPLATE_RESIDENT_NOTICE_CREATED=
+    WHATSAPP_TEMPLATE_RESIDENT_LOGIN_DETAILS_SENT=
 
 WHATSAPP_DEFAULT_COUNTRY_CODE must contain digits only, such as 92. Local phone
 numbers are skipped if it is unset; international numbers beginning with + or
@@ -45,6 +48,19 @@ numbers are skipped if it is unset; international numbers beginning with + or
 5. Payment rejected: name, bill number, amount, rejection reason.
 6. Contract approved: name, contract status, deposit status, admission status,
    activation note.
+7. Resident notice created: name, notice title, short description, published
+   date, resident notice portal URL.
+8. Resident login details: name, login email, one-time Supabase password setup
+   link, resident portal URL.
+
+`NEXT_PUBLIC_SITE_URL` is used to build resident portal links and the approved
+Supabase recovery redirect URL. Add
+`https://your-stayhub-domain.example/resident-portal/change-password` to the
+Supabase Auth redirect allow list.
+
+SMS is intentionally a tracked placeholder. When selected, a resident with a
+phone number receives `configuration_required` in the notification ledger;
+no external SMS request is made until an SMS provider adapter is implemented.
 
 When a provider is not configured, no external request is made. The business
 record remains saved and the user receives only a generic delivery warning.

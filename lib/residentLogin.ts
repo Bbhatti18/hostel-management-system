@@ -60,13 +60,21 @@ async function postResidentAction<T>(
     body: JSON.stringify({ residentId: cleanResidentId }),
   });
 
-  const payload = (await response.json().catch(() => null)) as
+  const responseText = await response.text();
+  const payload = (() => {
+    try {
+      return responseText ? JSON.parse(responseText) : null;
+    } catch {
+      return null;
+    }
+  })() as
     | (T & { error?: string })
     | null;
 
   if (!response.ok || !payload) {
     throw new Error(
-      payload?.error || "The resident portal account request could not be completed.",
+      payload?.error ||
+        `The resident portal account request failed with HTTP ${response.status}. Check the server log for details.`,
     );
   }
 

@@ -15,14 +15,16 @@ export default function ResidentNoticesPage() {
     setLoading(true); setError("");
     const auth = await resolveAuthenticatedResident();
     if (!auth.resident) { setError(auth.error || "Your resident profile could not be verified."); setLoading(false); return; }
-    const [noticeResult, admissionResult] = await Promise.all([
+    const [noticeResult, admissionResult, recipientResult] = await Promise.all([
       supabase.from("notices").select("id,title,description,notice_type,target_audience,audience,resident_id,room_id,priority,status,publish_date,expiry_date,is_active,pinned").eq("status", "Published").order("pinned", { ascending: false }).order("publish_date", { ascending: false }),
       supabase.from("admissions").select("room_id,status").eq("resident_id", auth.resident.id).ilike("status", "Active").order("created_at", { ascending: false }).limit(1).maybeSingle(),
+      supabase.from("notice_recipients").select("notice_id").eq("resident_id", auth.resident.id),
     ]);
-    if (noticeResult.error || admissionResult.error) { setError("Your notices could not be loaded. Please refresh and try again."); setLoading(false); return; }
+    if (noticeResult.error || admissionResult.error || recipientResult.error) { setError("Your notices could not be loaded. Please refresh and try again."); setLoading(false); return; }
     const roomId = text(admissionResult.data?.room_id);
+    const selectedNoticeIds = new Set((recipientResult.data ?? []).map((row) => text(row.notice_id)));
     const visible = ((noticeResult.data ?? []) as Notice[]).filter((notice) =>
-      isNoticeVisibleToResident(notice, auth.resident.id, roomId),
+      isNoticeVisibleToResident(notice, auth.resident.id, roomId, undefined, selectedNoticeIds),
     );
     setNotices(visible); setLoading(false);
   }, []);

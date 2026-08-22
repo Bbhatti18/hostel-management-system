@@ -28,6 +28,7 @@ const adminRoutes = [
 
 const residentPortalPath = "/resident-portal";
 const residentPortalDataPath = "/api/resident-portal/data";
+const residentPasswordSetupPath = "/resident-portal/change-password";
 const loginPath = "/login";
 
 function isAdminRoute(pathname: string) {
@@ -114,7 +115,7 @@ export async function proxy(request: NextRequest) {
   const { pathname } = request.nextUrl;
   const response = NextResponse.next();
 
-  if (pathname === loginPath || pathname === residentPortalDataPath) {
+  if (pathname === loginPath || pathname === residentPortalDataPath || pathname === residentPasswordSetupPath) {
     return response;
   }
 

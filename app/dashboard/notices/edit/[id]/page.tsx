@@ -17,6 +17,7 @@ import { supabase } from "@/lib/supabase";
 
 type AudienceType =
   | "All Residents"
+  | "Selected Residents"
   | "Specific Room"
   | "Specific Resident"
   | "Staff";
@@ -28,12 +29,13 @@ type PriorityType =
   | "Urgent";
 
 type StatusType =
+  | "Published"
   | "Active"
   | "Draft"
   | "Inactive";
 
 type GenericRecord = {
-  id: number;
+  id: string | number;
   [key: string]:
     | string
     | number
@@ -74,6 +76,7 @@ export default function EditNoticePage() {
 
   const [residentId, setResidentId] =
     useState("");
+  const [selectedResidentIds, setSelectedResidentIds] = useState<string[]>([]);
 
   const [staffId, setStaffId] =
     useState("");
@@ -145,6 +148,7 @@ export default function EditNoticePage() {
       roomsResponse,
       residentsResponse,
       staffResponse,
+      recipientResponse,
     ] = await Promise.all([
       supabase
         .from("notices")
@@ -166,13 +170,18 @@ export default function EditNoticePage() {
         .from("staff")
         .select("*")
         .order("id"),
+      supabase
+        .from("notice_recipients")
+        .select("resident_id")
+        .eq("notice_id", noticeId),
     ]);
 
     const error =
       noticeResponse.error ||
       roomsResponse.error ||
       residentsResponse.error ||
-      staffResponse.error;
+      staffResponse.error ||
+      recipientResponse.error;
 
     if (error) {
       setErrorMessage(error.message);
@@ -200,6 +209,7 @@ if (!notice) {
       (staffResponse.data ??
         []) as GenericRecord[]
     );
+    setSelectedResidentIds((recipientResponse.data ?? []).map((row) => String(row.resident_id)));
 
     setTitle(notice.title ?? "");
 
@@ -270,6 +280,7 @@ const handleAudienceChange = (
     setAudience(value);
     setRoomId("");
     setResidentId("");
+    setSelectedResidentIds([]);
     setStaffId("");
     setErrorMessage("");
     setSuccessMessage("");
@@ -307,6 +318,14 @@ const handleAudienceChange = (
     }
 
     if (
+      audience === "Selected Residents" &&
+      selectedResidentIds.length === 0
+    ) {
+      setErrorMessage("Please select at least one resident.");
+      return;
+    }
+
+    if (
       audience === "Specific Resident" &&
       !residentId
     ) {
@@ -334,18 +353,18 @@ const handleAudienceChange = (
 
         room_id:
           audience === "Specific Room"
-            ? Number(roomId)
+            ? roomId
             : null,
 
         resident_id:
           audience ===
           "Specific Resident"
-            ? Number(residentId)
+            ? residentId
             : null,
 
         staff_id:
           audience === "Staff"
-            ? Number(staffId)
+            ? staffId
             : null,
 
         attachment_url:
@@ -359,11 +378,34 @@ const handleAudienceChange = (
 
         pinned,
         status,
+        notification_recipient_type:
+          audience === "All Residents"
+            ? "all_active_residents"
+            : audience === "Selected Residents"
+              ? "selected_residents"
+              : audience === "Specific Resident"
+                ? "individual_resident"
+                : null,
       })
       .eq("id", noticeId);
 
     if (error) {
       setErrorMessage(error.message);
+      setSaving(false);
+      return;
+    }
+
+    const { error: clearRecipientError } = await supabase
+      .from("notice_recipients")
+      .delete()
+      .eq("notice_id", noticeId);
+    const { error: recipientError } = audience === "Selected Residents"
+      ? await supabase.from("notice_recipients").insert(
+          selectedResidentIds.map((selectedId) => ({ notice_id: noticeId, resident_id: selectedId })),
+        )
+      : { error: null };
+    if (clearRecipientError || recipientError) {
+      setErrorMessage("Notice details were updated, but selected recipients could not be updated.");
       setSaving(false);
       return;
     }
@@ -504,6 +546,10 @@ const handleAudienceChange = (
                   All Residents
                 </option>
 
+                <option value="Selected Residents">
+                  Selected Residents
+                </option>
+
                 <option value="Specific Room">
                   Specific Room
                 </option>
@@ -545,6 +591,29 @@ const handleAudienceChange = (
                     </option>
                   ))}
                 </select>
+              </div>
+            )}
+
+            {audience === "Selected Residents" && (
+              <div className="md:col-span-2">
+                <p className="mb-2 text-sm font-medium text-gray-700">Selected Residents</p>
+                <div className="max-h-64 space-y-2 overflow-y-auto rounded-lg border border-gray-200 p-3">
+                  {residentOptions.map((resident) => {
+                    const id = String(resident.value);
+                    return (
+                      <label key={id} className="flex items-center gap-3 rounded-lg px-2 py-2 text-sm hover:bg-gray-50">
+                        <input
+                          type="checkbox"
+                          checked={selectedResidentIds.includes(id)}
+                          onChange={() => setSelectedResidentIds((current) => current.includes(id) ? current.filter((item) => item !== id) : [...current, id])}
+                          className="h-4 w-4 rounded border-gray-300 text-blue-600"
+                        />
+                        {resident.label}
+                      </label>
+                    );
+                  })}
+                </div>
+                <p className="mt-2 text-sm font-medium text-blue-700">{selectedResidentIds.length} resident(s) selected</p>
               </div>
             )}
 
@@ -671,6 +740,9 @@ const handleAudienceChange = (
                 }
                 className="w-full rounded-lg border border-gray-300 px-3 py-2.5"
               >
+                <option value="Published">
+                  Published
+                </option>
                 <option value="Active">
                   Active
                 </option>

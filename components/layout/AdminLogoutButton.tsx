@@ -35,12 +35,12 @@ export default function AdminLogoutButton() {
         type="button"
         onClick={() => void handleLogout()}
         disabled={loggingOut}
-        className="rounded-xl border border-red-200 bg-white px-5 py-3 font-semibold text-red-700 shadow-sm transition hover:bg-red-50 disabled:cursor-wait disabled:opacity-60"
+        className="rounded-xl border border-red-200 bg-white px-5 py-3 font-semibold text-red-700 shadow-sm transition hover:bg-red-50 disabled:cursor-wait disabled:opacity-60 dark:border-red-900 dark:bg-slate-800 dark:text-red-300 dark:hover:bg-red-950/60"
       >
         {loggingOut ? "Logging out..." : "Logout"}
       </button>
       {logoutError && (
-        <p role="alert" className="max-w-xs text-right text-sm text-red-600">
+        <p role="alert" className="max-w-xs text-right text-sm text-red-600 dark:text-red-300">
           {logoutError}
         </p>
       )}

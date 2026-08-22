@@ -105,20 +105,20 @@ export async function GET(request: NextRequest) {
         supabaseAdmin
           .from("bills")
           .select(
-            "id, bill_number, resident_id, admission_id, billing_month, due_date, rent_amount, electricity_amount, ac_amount, other_amount, discount_amount, total_amount, paid_amount, balance_amount, bill_status, notes",
+            "id, bill_number, resident_id, admission_id, billing_month, due_date, rent_amount, room_rent, electricity_amount, ac_amount, ac_bill, maintenance_fee, other_amount, other_charges, discount_amount, discount, total_amount, paid_amount, balance_amount, bill_status, notes",
           )
           .eq("resident_id", residentId)
           .order("billing_month", { ascending: false }),
         supabaseAdmin
           .from("payments")
           .select(
-            "id, bill_id, resident_id, payment_number, payment_date, amount, payment_method, reference_number, payment_status, verified, notes, created_at",
+            "id, bill_id, receipt_id, resident_id, payment_number, payment_date, amount, payment_method, reference_number, payment_status, verified, verified_by, verified_at, notes, created_at",
           )
           .eq("resident_id", residentId)
           .order("created_at", { ascending: false }),
         supabaseAdmin
           .from("payment_receipts")
-          .select("id, bill_id, resident_id, amount, reference_number, status, notes, created_at")
+          .select("id, payment_id, bill_id, resident_id, amount, reference_number, status, verified_by, verified_at, notes, created_at")
           .eq("resident_id", residentId)
           .order("created_at", { ascending: false }),
         admission?.room_id

@@ -2,7 +2,7 @@
 
 import Link from "next/link";
 import { useCallback, useEffect, useMemo, useState } from "react";
-import AdminLogoutButton from "@/components/layout/AdminLogoutButton";
+import ProfileDropdown from "@/components/layout/ProfileDropdown";
 import Sidebar from "@/components/layout/Sidebar";
 import { buildDashboardSummary, type DashboardData, type DashboardTask } from "@/lib/dashboardData";
 import { supabase } from "@/lib/supabase";
@@ -21,10 +21,10 @@ const quickActions = [
 ];
 
 const taskTone: Record<DashboardTask["tone"], string> = {
-  red: "border-red-200 bg-red-50 text-red-800",
-  amber: "border-amber-200 bg-amber-50 text-amber-800",
-  blue: "border-blue-200 bg-blue-50 text-blue-800",
-  slate: "border-slate-200 bg-white text-slate-800",
+  red: "border-red-200 bg-red-50 text-red-800 dark:border-red-900 dark:bg-red-950/60 dark:text-red-200",
+  amber: "border-amber-200 bg-amber-50 text-amber-800 dark:border-amber-900 dark:bg-amber-950/60 dark:text-amber-200",
+  blue: "border-blue-200 bg-blue-50 text-blue-800 dark:border-blue-900 dark:bg-blue-950/60 dark:text-blue-200",
+  slate: "border-slate-200 bg-white text-slate-800 dark:border-slate-700 dark:bg-slate-800 dark:text-slate-100",
 };
 
 const activityTone = {
@@ -93,39 +93,36 @@ export default function DashboardPage() {
     : summary.activities.slice(0, 3);
 
   return (
-    <main className="min-h-screen bg-gray-100">
+    <main className="min-h-screen bg-gray-100 text-slate-950 dark:bg-slate-950 dark:text-slate-100">
       <div className="flex">
         <Sidebar />
         <section className="min-w-0 flex-1 p-6 sm:p-10">
           <header className="mb-8 flex flex-wrap items-center justify-between gap-4">
             <div>
-              <h2 className="text-4xl font-bold">Welcome Back 👋</h2>
-              <p className="mt-2 text-gray-600">StayHub Admin Dashboard</p>
+              <h2 className="text-4xl font-bold text-slate-950 dark:text-white">Welcome Back 👋</h2>
+              <p className="mt-2 text-gray-600 dark:text-slate-300">StayHub Admin Dashboard</p>
             </div>
-            <div className="flex items-center gap-4">
-              <AdminLogoutButton />
-              <div className="flex h-12 w-12 items-center justify-center rounded-full bg-blue-600 font-bold text-white">A</div>
-            </div>
+            <ProfileDropdown />
           </header>
 
-          {error && <div className="mb-6 rounded-xl border border-red-200 bg-red-50 px-4 py-3 text-sm font-medium text-red-700">{error}</div>}
+          {error && <div className="mb-6 rounded-xl border border-red-200 bg-red-50 px-4 py-3 text-sm font-medium text-red-700 dark:border-red-900 dark:bg-red-950/60 dark:text-red-200">{error}</div>}
 
-          <h3 className="mb-6 text-2xl font-semibold text-gray-800">Quick Actions</h3>
+          <h3 className="mb-6 text-2xl font-semibold text-gray-800 dark:text-slate-100">Quick Actions</h3>
           <div className="grid gap-6 md:grid-cols-2 xl:grid-cols-4">
             {quickActions.map((action) => (
-              <Link key={action.href} href={action.href} className="rounded-2xl bg-white p-6 shadow-lg transition hover:-translate-y-1 hover:shadow-xl focus:outline-none focus:ring-4 focus:ring-blue-200">
+              <Link key={action.href} href={action.href} className="rounded-2xl bg-white p-6 text-slate-950 shadow-lg transition hover:-translate-y-1 hover:shadow-xl focus:outline-none focus:ring-4 focus:ring-blue-200 dark:bg-slate-800 dark:text-slate-100 dark:focus:ring-blue-800">
                 <div className="text-4xl" aria-hidden="true">{action.icon}</div>
                 <h4 className="mt-4 text-xl font-bold">{action.title}</h4>
-                <p className="mt-2 text-sm text-gray-500">{action.description}</p>
+                <p className="mt-2 text-sm text-gray-600 dark:text-slate-300">{action.description}</p>
               </Link>
             ))}
           </div>
 
           <div className="mt-10 grid gap-6 lg:grid-cols-2">
-            <section className="rounded-2xl bg-white p-6 shadow-lg">
+            <section className="rounded-2xl bg-white p-6 text-slate-950 shadow-lg dark:bg-slate-800 dark:text-slate-100">
               <h3 className="text-xl font-bold">Today&apos;s Tasks</h3>
               <div className="mt-5 space-y-3">
-                {loading ? <p className="rounded-xl border border-slate-200 p-4 text-sm text-slate-500">Loading current tasks...</p> : summary.tasks.length === 0 ? <p className="rounded-xl border border-slate-200 p-4 text-sm text-slate-500">No urgent tasks right now.</p> : summary.tasks.map((item) => (
+                {loading ? <p className="rounded-xl border border-slate-200 p-4 text-sm text-slate-600 dark:border-slate-700 dark:text-slate-300">Loading current tasks...</p> : summary.tasks.length === 0 ? <p className="rounded-xl border border-slate-200 p-4 text-sm text-slate-600 dark:border-slate-700 dark:text-slate-300">No urgent tasks right now.</p> : summary.tasks.map((item) => (
                   <Link key={item.id} href={item.href} className={`flex items-center justify-between gap-4 rounded-xl border p-4 transition hover:brightness-95 ${taskTone[item.tone]}`}>
                     <span className="font-medium">{item.count} {item.label}</span><span aria-hidden="true" className="text-lg">→</span>
                   </Link>
@@ -133,13 +130,13 @@ export default function DashboardPage() {
               </div>
             </section>
 
-            <section className="rounded-2xl bg-white p-6 shadow-lg">
+            <section className="rounded-2xl bg-white p-6 text-slate-950 shadow-lg dark:bg-slate-800 dark:text-slate-100">
               <h3 className="text-xl font-bold">Recent Activity</h3>
               <div className="mt-5 space-y-4">
-                {loading ? <p className="text-sm text-slate-500">Loading recent activity...</p> : summary.activities.length === 0 ? <p className="text-sm text-slate-500">No recent activity is available.</p> : visibleActivities.map((activity) => (
-                  <Link key={activity.id} href={activity.href} className={`block border-l-4 pl-4 transition hover:bg-slate-50 ${activityTone[activity.tone]}`}>
-                    <p className="font-medium text-slate-800">{activity.description}</p>
-                    <p className="mt-1 text-xs text-slate-500">{formatActivityDate(activity.occurredAt)}</p>
+                {loading ? <p className="text-sm text-slate-600 dark:text-slate-300">Loading recent activity...</p> : summary.activities.length === 0 ? <p className="text-sm text-slate-600 dark:text-slate-300">No recent activity is available.</p> : visibleActivities.map((activity) => (
+                  <Link key={activity.id} href={activity.href} className={`block border-l-4 pl-4 transition hover:bg-slate-50 dark:hover:bg-slate-700/70 ${activityTone[activity.tone]}`}>
+                    <p className="font-medium text-slate-800 dark:text-slate-100">{activity.description}</p>
+                    <p className="mt-1 text-xs text-slate-600 dark:text-slate-300">{formatActivityDate(activity.occurredAt)}</p>
                   </Link>
                 ))}
               </div>
@@ -147,7 +144,7 @@ export default function DashboardPage() {
                 <button
                   type="button"
                   onClick={() => setShowAllActivity((current) => !current)}
-                  className="mt-5 w-full rounded-xl border border-slate-200 bg-white px-4 py-3 text-sm font-semibold text-blue-700 transition hover:bg-slate-50"
+                  className="mt-5 w-full rounded-xl border border-slate-200 bg-white px-4 py-3 text-sm font-semibold text-blue-700 transition hover:bg-slate-50 dark:border-slate-600 dark:bg-slate-800 dark:text-blue-300 dark:hover:bg-slate-700"
                 >
                   {showAllActivity ? "Show Less" : "View All Recent Activity"}
                 </button>

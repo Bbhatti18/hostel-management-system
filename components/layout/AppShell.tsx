@@ -2,7 +2,7 @@
 
 import { usePathname } from "next/navigation";
 import type { ReactNode } from "react";
-import AdminLogoutButton from "@/components/layout/AdminLogoutButton";
+import ProfileDropdown from "@/components/layout/ProfileDropdown";
 import Sidebar from "@/components/layout/Sidebar";
 
 const adminRoutes = [
@@ -48,8 +48,8 @@ export default function AppShell({ children }: { children: ReactNode }) {
     <div className="flex min-h-screen w-full">
       {!hasEmbeddedSidebar(pathname) && <Sidebar />}
       <div className="min-w-0 flex-1">
-        <header className="flex min-h-20 items-center justify-end border-b border-slate-200 bg-white px-4 py-3 sm:px-6 lg:px-8">
-          <AdminLogoutButton />
+        <header className="flex min-h-20 items-center justify-end border-b border-slate-200 bg-white px-4 py-3 sm:px-6 lg:px-8 dark:border-slate-700 dark:bg-slate-900">
+          <ProfileDropdown />
         </header>
         {children}
       </div>
